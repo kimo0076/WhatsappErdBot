@@ -282,6 +282,10 @@ class OrderService {
     if (!order) return { ok: false, reason: 'NOT_FOUND' };
     if (order.status === ORDER_STATUS.CANCELLED) return { ok: false, reason: 'CANCELLED' };
     if (order.status === ORDER_STATUS.COMPLETED) return { ok: false, reason: 'COMPLETED' };
+    if (order.status === ORDER_STATUS.CONFIRMED || order.status === ORDER_STATUS.LOCATION_COLLECTED ||
+        order.status === ORDER_STATUS.IN_TRANSIT || order.status === ORDER_STATUS.DELIVERED) {
+      return { ok: false, reason: 'ALREADY_CONFIRMED' };
+    }
 
     const wasBackorder = order.status === ORDER_STATUS.PENDING_APPROVAL;
     const items = this.getItems(order.id);
@@ -415,6 +419,9 @@ class OrderService {
     const order = this.getByNumber(orderNumber);
     if (!order) return { ok: false, reason: 'NOT_FOUND' };
     if (order.status === ORDER_STATUS.CANCELLED) return { ok: false, reason: 'CANCELLED' };
+    if (order.status !== ORDER_STATUS.CONFIRMED && order.status !== ORDER_STATUS.LOCATION_COLLECTED) {
+      return { ok: false, reason: 'INVALID_TRANSITION' };
+    }
 
     db.txMain(() => {
       db.getMain().prepare(`
@@ -433,6 +440,9 @@ class OrderService {
     const order = this.getByNumber(orderNumber);
     if (!order) return { ok: false, reason: 'NOT_FOUND' };
     if (order.status === ORDER_STATUS.CANCELLED) return { ok: false, reason: 'CANCELLED' };
+    if (order.status !== ORDER_STATUS.IN_TRANSIT && order.status !== ORDER_STATUS.DELIVERED) {
+      return { ok: false, reason: 'INVALID_TRANSITION' };
+    }
 
     db.txMain(() => {
       db.getMain().prepare(`
@@ -456,6 +466,9 @@ class OrderService {
     const order = this.getByNumber(orderNumber);
     if (!order) return { ok: false, reason: 'NOT_FOUND' };
     if (order.status === ORDER_STATUS.CANCELLED) return { ok: false, reason: 'CANCELLED' };
+    if (order.status !== ORDER_STATUS.CONFIRMED && order.status !== ORDER_STATUS.LOCATION_COLLECTED) {
+      return { ok: false, reason: 'INVALID_TRANSITION' };
+    }
 
     db.txMain(() => {
       db.getMain().prepare(`

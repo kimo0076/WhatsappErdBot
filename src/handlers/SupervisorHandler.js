@@ -19,6 +19,16 @@ const {
 const ORDER_NUMBER_RE = /(ord-?\d{8}-\d{3}|\d{3,8}[-\s]\d{3,8}(?:-(?:\d{3}|ord))?)/i;
 const PHONE_RE = /(\+\d{7,15}|\d{7,15})/;
 
+const ERROR_MESSAGES = {
+  NOT_FOUND: (no) => `❌ الطلب ${no} غير موجود.`,
+  CANCELLED: (no) => `❌ الطلب ${no} ملغي.`,
+  ALREADY_CANCELLED: (no) => `❌ الطلب ${no} ملغي بالفعل.`,
+  ALREADY_CONFIRMED: (no) => `❌ الطلب ${no} مؤكد بالفعل.`,
+  COMPLETED: (no) => `❌ الطلب ${no} مكتمل بالفعل.`,
+  OUT_OF_STOCK: (no) => `❌ تعذرت الموافقة: المخزون غير كافٍ. تم إعادة الطلب لحالة الانتظار.`,
+  INVALID_TRANSITION: (no) => `❌ لا يمكن تنفيذ هذا الإجراء على الطلب ${no} من حالته الحالية.`,
+};
+
 /**
  * Supervisor command handler.
  *
@@ -36,7 +46,7 @@ class SupervisorHandler {
 
     if (document) {
       logger.info(`  📄 Supervisor [${phone}]: importing ${document.fileName}`);
-      return this._handleDocumentImport(jid, phone, document);
+      return this._handleImport(jid, phone, { document });
     }
 
     if (!text) return;
@@ -67,7 +77,7 @@ class SupervisorHandler {
     // Detect ad-hoc CSV pasted as a single message.
     if ((text.match(/,/g) || []).length >= 2) {
       logger.info(`  📄 Supervisor [${phone}]: possible CSV data`);
-      const handled = await this._tryImportCSV(jid, phone, text);
+      const handled = await this._handleImport(jid, phone, { text }, { quick: true });
       if (handled) return;
     }
 
@@ -117,6 +127,9 @@ class SupervisorHandler {
       { name: 'stats', match: exact(/^(stats|\/stats|احصائيات|تقرير|تقرير اليوم)$/i),
         run: (jid) => this._cmdStats(jid) },
 
+      { name: 'allOrders', match: exact(/^(allorders|\/allorders|جميع الطلبات|كل الطلبات)$/i),
+        run: (jid) => this._cmdAllOrders(jid) },
+
       { name: 'stock', match: exact(/^(stock|stocks|\/stock|\/stocks|مخزون|المخزون|جرد)$/i),
         run: (jid) => this._cmdStock(jid) },
 
@@ -138,21 +151,21 @@ class SupervisorHandler {
       { name: 'status', match: captured(/^(?:status|\/status|حالة|تفاصيل)\s+((?:ord-?)?\d{3,8}[-\s]?\d{3,8}(?:-(?:\d{3}|ord))?)$/i),
         run: (jid, phone, [orderInput]) => this._cmdStatus(jid, orderInput) },
 
-      { name: 'deliver', match: captured(/^(?:deliver|\/deliver|توصيل|شحن)\s+((?:ord-?)?\d{3,8}[-\s]?\d{3,8}(?:-(?:\d{3}|ord))?)$/i),
+      { name: 'deliver', match: captured(/^(?:deliver|\/deliver|توصيل|شحن)\s+((?:ord-?)?\d{3,8}[-\s]?\d{3,8}(?:-(?:\d{3}|ord))?)\s*.*$/i),
         run: (jid, phone, [orderInput]) => this._cmdDeliver(jid, phone, orderInput) },
 
       { name: 'complete', match: captured(/^(?:complete|\/complete|مكتمل|انهاء|إنهاء)\s+((?:ord-?)?\d{3,8}[-\s]?\d{3,8}(?:-(?:\d{3}|ord))?)$/i),
         run: (jid, phone, [orderInput]) => this._cmdComplete(jid, phone, orderInput) },
 
       { name: 'assign',
-        match: captured(/^(?:assign|\/assign|تعيين)\s+((?:ord-?)?\d{3,8}[-\s]?\d{3,8}(?:-(?:\d{3}|ord))?)\s+(\+?\d{7,15})(?:\s+(.+))?$/i),
+        match: captured(/^(?:assign|\/assign|تعيين)\s+((?:ord-?)?\d{3,8}[-\s]?\d{3,8}(?:-(?:\d{3}|ord))?)(?:\s+(\+?\d{7,15})(?:\s+(.+))?)?$/i),
         run: (jid, phone, [orderInput, delPhone, notes]) =>
           this._cmdAssign(jid, phone, orderInput,
-            delPhone.startsWith('+') ? delPhone : '+' + delPhone, notes || null) },
+            delPhone ? (delPhone.startsWith('+') ? delPhone : '+' + delPhone) : null, notes || null) },
 
       { name: 'importInline',
-        match: captured(/^(?:import|\/import|استيراد)\s+(.+)$/i),
-        run: (jid, phone, [data]) => this._handleInlineImport(jid, phone, data) },
+        match: captured(/^(?:import|\/import|استيراد)\s+([\s\S]+)$/i),
+        run: (jid, phone, [data]) => this._handleImport(jid, phone, { text: data }) },
 
       { name: 'importHelp', match: exact(/^(import|\/import|استيراد)$/i),
         run: (jid) => this._cmdImportHelp(jid) },
@@ -167,7 +180,7 @@ class SupervisorHandler {
   async _cmdOrders(jid) {
     const orders = Order.listPending(20);
     if (!orders.length) {
-      return this.client.sendTypingReply(jid, '✅ لا توجد طلبات معلقة.');
+      return this._reply(jid, '✅ لا توجد طلبات معلقة.');
     }
 
     const company = config.company;
@@ -188,10 +201,9 @@ class SupervisorHandler {
     lines.push('---');
     lines.push('🔹 *موافقة ORD-xxxxx*');
     lines.push('🔹 *رفض ORD-xxxxx [سبب]*');
-    await this.client.sendTypingReply(jid, lines.join('\n'));
+    await this._reply(jid, lines.join('\n'));
   }
 
-  // Bug #5: Auto-approve toggle
   async _cmdAutoApprove(jid, phone) {
     const current = settings.getBool('auto_approve_orders', false);
     const newValue = !current;
@@ -202,151 +214,184 @@ class SupervisorHandler {
       : '❌ *تم إيقاف القبول التلقائي*\n\nالطلبات التي تحتاج مراجعة ستنتظر موافقة المشرف.';
 
     logger.info(`Auto-approve toggled to ${newValue} by ${phone}`);
-    await this.client.sendTypingReply(jid, statusText);
+    await this._reply(jid, statusText);
   }
 
   async _cmdApprove(jid, supPhone, orderInput) {
-    const orderNumber = this._resolveOrderNumber(orderInput);
-    if (!orderNumber) {
-      return this.client.sendTypingReply(jid, `❌ الطلب "${orderInput}" غير موجود.`);
-    }
+    return this._withOrder(jid, orderInput, async (jid, orderNumber) => {
+      const r = Order.approve(orderNumber, supPhone);
+      if (!r.ok) return this._sendOrderError(jid, orderNumber, r.reason);
 
-    const r = Order.approve(orderNumber, supPhone);
-    if (!r.ok) {
-      const reasonMap = {
-        NOT_FOUND: `❌ الطلب ${orderNumber} غير موجود.`,
-        CANCELLED: `❌ الطلب ${orderNumber} ملغي.`,
-        COMPLETED: `❌ الطلب ${orderNumber} مكتمل بالفعل.`,
-        OUT_OF_STOCK: `❌ تعذر الموافقة: المخزون غير كافٍ. تم إعادة الطلب لحالة الانتظار.`,
-      };
-      return this.client.sendTypingReply(jid, reasonMap[r.reason] || `❌ فشلت الموافقة (${r.reason})`);
-    }
-
-    await this.client.sendTypingReply(jid, `✅ تمت الموافقة على الطلب ${orderNumber}.`);
-    if (r.order.whatsapp_jid) {
-      this.client.sendTypingReply(r.order.whatsapp_jid,
-        `✅ *تمت الموافقة على طلبك!*\n` +
-        `🆔 رقم الطلب: *${orderNumber}*\n` +
-        `سنقوم بتجهيز طلبك والتواصل معك قريباً.`
-      ).catch((err) => logger.warn(`Notify customer ${orderNumber} failed: ${err.message}`));
-    }
+      await this._reply(jid, `✅ تمت الموافقة على الطلب ${orderNumber}.`);
+      if (r.order.whatsapp_jid) {
+        this.client.sendTypingReply(r.order.whatsapp_jid,
+          `✅ *تمت الموافقة على طلبك!*\n` +
+          `🆔 رقم الطلب: *${orderNumber}*\n` +
+          `سنقوم بتجهيز طلبك والتواصل معك قريباً.`
+        ).catch((err) => logger.warn(`Notify customer ${orderNumber} failed: ${err.message}`));
+      }
+    });
   }
 
   async _cmdReject(jid, supPhone, orderInput, reason) {
-    const orderNumber = this._resolveOrderNumber(orderInput);
-    if (!orderNumber) {
-      return this.client.sendTypingReply(jid, `❌ الطلب "${orderInput}" غير موجود.`);
-    }
+    return this._withOrder(jid, orderInput, async (jid, orderNumber) => {
+      const r = Order.reject(orderNumber, supPhone, reason);
+      if (!r.ok) return this._sendOrderError(jid, orderNumber, r.reason);
 
-    const r = Order.reject(orderNumber, supPhone, reason);
-    if (!r.ok) {
-      const reasonMap = {
-        NOT_FOUND: `❌ الطلب ${orderNumber} غير موجود.`,
-        ALREADY_CANCELLED: `❌ الطلب ${orderNumber} ملغي بالفعل.`,
-      };
-      return this.client.sendTypingReply(jid, reasonMap[r.reason] || `❌ ${r.reason}`);
-    }
-    await this.client.sendTypingReply(jid, `❌ تم رفض الطلب ${orderNumber}.`);
-    if (r.order.whatsapp_jid) {
-      const reasonText = reason ? `\n📝 السبب: ${reason}\n` : '\n';
-      this.client.sendTypingReply(r.order.whatsapp_jid,
-        `❌ *نأسف! تم رفض طلبك*\n\n` +
-        `🆔 رقم الطلب: *${orderNumber}*\n` +
-        reasonText +
-        `يمكنك الاطلاع على منتجات أخرى بكتابة *منتجات*`
-      ).catch((err) => logger.warn(`Notify customer ${orderNumber} failed: ${err.message}`));
-    }
+      await this._reply(jid, `❌ تم رفض الطلب ${orderNumber}.`);
+      if (r.order.whatsapp_jid) {
+        const reasonText = reason ? `\n📝 السبب: ${reason}\n` : '\n';
+        this.client.sendTypingReply(r.order.whatsapp_jid,
+          `❌ *نأسف! تم رفض طلبك*\n\n` +
+          `🆔 رقم الطلب: *${orderNumber}*\n` +
+          reasonText +
+          `يمكنك الاطلاع على منتجات أخرى بكتابة *منتجات*`
+        ).catch((err) => logger.warn(`Notify customer ${orderNumber} failed: ${err.message}`));
+      }
+    });
   }
 
   async _cmdStatus(jid, orderInput) {
-    const orderNumber = this._resolveOrderNumber(orderInput);
-    if (!orderNumber) {
-      return this.client.sendTypingReply(jid, `❌ الطلب "${orderInput}" غير موجود.`);
-    }
+    return this._withOrder(jid, orderInput, async (jid, orderNumber) => {
+      const order = Order.getByNumber(orderNumber);
+      if (!order) return this._reply(jid, `❌ الطلب ${orderNumber} غير موجود.`);
 
-    const order = Order.getByNumber(orderNumber);
-    if (!order) {
-      return this.client.sendTypingReply(jid, `❌ الطلب ${orderNumber} غير موجود.`);
-    }
-    const items = Order.getItems(order.id);
-    const company = config.company;
+      const items = Order.getItems(order.id);
+      const company = config.company;
 
-    const lines = [
-      `🔍 *تفاصيل الطلب ${orderNumber}*`,
-      '',
-      `📱 العميل: ${phoneUtil.formatForDisplay(order.phone_number)}`,
-      `📌 الحالة: ${STATUS_LABELS_AR[order.status] || order.status}`,
-      '',
-      '📦 *المنتجات:*',
-    ];
-    items.forEach((it) => {
-      lines.push(`   • ${it.product_name} — ${it.quantity}x × ${it.unit_price} ${company.symbol}`);
+      const lines = [
+        `🔍 *تفاصيل الطلب ${orderNumber}*`,
+        '',
+        `📱 العميل: ${phoneUtil.formatForDisplay(order.phone_number)}`,
+        `📌 الحالة: ${STATUS_LABELS_AR[order.status] || order.status}`,
+        '',
+        '📦 *المنتجات:*',
+      ];
+      items.forEach((it) => {
+        lines.push(`   • ${it.product_name} — ${it.quantity}x × ${it.unit_price} ${company.symbol}`);
+      });
+      lines.push(`💰 الإجمالي: ${order.total_amount} ${company.symbol}`);
+      if (order.delivery_address) lines.push(`📍 العنوان: ${order.delivery_address}`);
+      if (order.delivery_phone) lines.push(`🚚 مندوب التوصيل: ${order.delivery_phone}`);
+      if (order.delivery_notes) lines.push(`📝 ملاحظات التوصيل: ${order.delivery_notes}`);
+      if (order.customer_message) lines.push(`💬 رسالة العميل: ${order.customer_message}`);
+      if (order.cancellation_reason) lines.push(`📝 سبب الإلغاء: ${order.cancellation_reason}`);
+      lines.push(`🕐 أنشئ: ${order.created_at}`);
+
+      // Contextual hint
+      const status = order.status;
+      lines.push('');
+      if (status === ORDER_STATUS.PENDING || status === ORDER_STATUS.PENDING_APPROVAL) {
+        lines.push(`💡 للموافقة: *موافقة ${orderNumber}* | للرفض: *رفض ${orderNumber}*`);
+      } else if (status === ORDER_STATUS.CONFIRMED || status === ORDER_STATUS.LOCATION_COLLECTED) {
+        lines.push(`💡 للتوصيل: *توصيل ${orderNumber}* | للتعيين: *تعيين ${orderNumber} <رقم>*`);
+      } else if (status === ORDER_STATUS.IN_TRANSIT || status === ORDER_STATUS.DELIVERED) {
+        lines.push(`💡 للإكمال: *إنهاء ${orderNumber}*`);
+      }
+
+      await this._reply(jid, lines.join('\n'));
     });
-    lines.push(`💰 الإجمالي: ${order.total_amount} ${company.symbol}`);
-    if (order.delivery_address) lines.push(`📍 العنوان: ${order.delivery_address}`);
-    if (order.delivery_phone) lines.push(`🚚 مندوب التوصيل: ${order.delivery_phone}`);
-    if (order.delivery_notes) lines.push(`📝 ملاحظات التوصيل: ${order.delivery_notes}`);
-    if (order.customer_message) lines.push(`💬 رسالة العميل: ${order.customer_message}`);
-    if (order.cancellation_reason) lines.push(`📝 سبب الإلغاء: ${order.cancellation_reason}`);
-    lines.push(`🕐 أنشئ: ${order.created_at}`);
-
-    await this.client.sendTypingReply(jid, lines.join('\n'));
   }
 
   async _cmdDeliver(jid, supPhone, orderInput) {
-    const orderNumber = this._resolveOrderNumber(orderInput);
-    if (!orderNumber) {
-      return this.client.sendTypingReply(jid, `❌ الطلب "${orderInput}" غير موجود.`);
-    }
-
-    const r = Order.markInTransit(orderNumber, supPhone);
-    if (!r.ok) return this._sendOrderError(jid, orderNumber, r.reason);
-    await this.client.sendTypingReply(jid, `🚚 تم تحديث الطلب ${orderNumber} — قيد التوصيل.`);
-    if (r.order.whatsapp_jid) {
-      this.client.sendTypingReply(r.order.whatsapp_jid,
-        `🚚 *طلبك ${orderNumber} في الطريق!*\nسيصلك مندوب التوصيل قريباً 📞`
-      ).catch(() => {});
-    }
+    return this._withOrder(jid, orderInput, async (jid, orderNumber) => {
+      const r = Order.markInTransit(orderNumber, supPhone);
+      if (!r.ok) return this._sendOrderError(jid, orderNumber, r.reason);
+      await this._reply(jid, `🚚 تم تحديث الطلب ${orderNumber} — قيد التوصيل.`);
+      if (r.order.whatsapp_jid) {
+        this.client.sendTypingReply(r.order.whatsapp_jid,
+          `🚚 *طلبك ${orderNumber} في الطريق!*\nسيصلك مندوب التوصيل قريباً 📞`
+        ).catch(() => {});
+      }
+    });
   }
 
   async _cmdComplete(jid, supPhone, orderInput) {
-    const orderNumber = this._resolveOrderNumber(orderInput);
-    if (!orderNumber) {
-      return this.client.sendTypingReply(jid, `❌ الطلب "${orderInput}" غير موجود.`);
-    }
-
-    const r = Order.complete(orderNumber, supPhone);
-    if (!r.ok) return this._sendOrderError(jid, orderNumber, r.reason);
-    await this.client.sendTypingReply(jid, `🏁 تم إكمال الطلب ${orderNumber}.`);
-    if (r.order.whatsapp_jid) {
-      this.client.sendTypingReply(r.order.whatsapp_jid,
-        `🏁 *تم إكمال طلبك ${orderNumber}!*\nنشكرك على ثقتك.\nيسعدنا خدمتك دائماً.`
-      ).catch(() => {});
-    }
+    return this._withOrder(jid, orderInput, async (jid, orderNumber) => {
+      const r = Order.complete(orderNumber, supPhone);
+      if (!r.ok) return this._sendOrderError(jid, orderNumber, r.reason);
+      await this._reply(jid, `🏁 تم إكمال الطلب ${orderNumber}.`);
+      if (r.order.whatsapp_jid) {
+        this.client.sendTypingReply(r.order.whatsapp_jid,
+          `🏁 *تم إكمال طلبك ${orderNumber}!*\nنشكرك على ثقتك.\nيسعدنا خدمتك دائماً.`
+        ).catch(() => {});
+      }
+    });
   }
 
   async _cmdAssign(jid, supPhone, orderInput, deliveryPhone, notes) {
-    const orderNumber = this._resolveOrderNumber(orderInput);
-    if (!orderNumber) {
-      return this.client.sendTypingReply(jid, `❌ الطلب "${orderInput}" غير موجود.`);
-    }
-
-    const r = Order.assignDelivery(orderNumber, supPhone, deliveryPhone, notes);
-    if (!r.ok) return this._sendOrderError(jid, orderNumber, r.reason);
-    await this.client.sendTypingReply(jid,
-      `🚚 تم تعيين مندوب التوصيل (${deliveryPhone}) للطلب ${orderNumber}.` +
-      (notes ? `\n📝 ${notes}` : ''));
+    return this._withOrder(jid, orderInput, async (jid, orderNumber) => {
+      const r = Order.assignDelivery(orderNumber, supPhone, deliveryPhone, notes);
+      if (!r.ok) return this._sendOrderError(jid, orderNumber, r.reason);
+      await this._reply(jid,
+        `🚚 تم تعيين مندوب التوصيل (${deliveryPhone}) للطلب ${orderNumber}.` +
+        (notes ? `\n📝 ${notes}` : ''));
+    });
   }
+
+  // ────────────────────────────────────────────────────────────────────
+  // Shared helpers
+  // ────────────────────────────────────────────────────────────────────
 
   _sendOrderError(jid, orderNumber, reason) {
-    const map = {
-      NOT_FOUND: `❌ الطلب ${orderNumber} غير موجود.`,
-      CANCELLED: `❌ الطلب ${orderNumber} ملغي.`,
-      ALREADY_CANCELLED: `❌ الطلب ${orderNumber} ملغي بالفعل.`,
-    };
-    return this.client.sendTypingReply(jid, map[reason] || `❌ ${reason}`);
+    const fn = ERROR_MESSAGES[reason];
+    return this._reply(jid, fn ? fn(orderNumber) : `❌ ${reason}`);
   }
 
+  async _withOrder(jid, input, fn) {
+    const orderNumber = this._resolveOrderNumber(input);
+    if (!orderNumber) {
+      return this._reply(jid, `❌ الطلب "${input}" غير موجود.`);
+    }
+    return fn(jid, orderNumber);
+  }
+
+
+  async _cmdAllOrders(jid) {
+    const mdb = db.getMain();
+    const orders = mdb.prepare(`
+      SELECT o.*, c.phone_number AS customer_phone
+        FROM orders o JOIN customers c ON o.customer_id = c.id
+       WHERE date(o.created_at) = date('now')
+         AND o.status != 'cancelled'
+       ORDER BY o.created_at DESC LIMIT 30
+    `).all();
+
+    if (!orders.length) {
+      return this._reply(jid, '✅ لا توجد طلبات نشطة اليوم.');
+    }
+
+    const company = config.company;
+    const groups = { pending: [], confirmed: [], in_transit: [], completed: [] };
+
+    for (const o of orders) {
+      const status = o.status === 'pending_supervisor_approval' ? 'pending' : o.status;
+      const key = status === 'location_collected' ? 'confirmed' : status;
+      if (groups[key]) groups[key].push(o);
+    }
+
+    const lines = ['📋 *جميع الطلبات النشطة اليوم*', ''];
+
+    const sections = [
+      { key: 'pending', emoji: '📌', label: 'معلقة' },
+      { key: 'confirmed', emoji: '✅', label: 'مؤكدة / تم استلام الموقع' },
+      { key: 'in_transit', emoji: '🚚', label: 'قيد التوصيل' },
+      { key: 'completed', emoji: '🏁', label: 'مكتملة' },
+    ];
+
+    for (const sec of sections) {
+      const items = groups[sec.key];
+      if (!items.length) continue;
+      lines.push(`${sec.emoji} *${sec.label}* (${items.length}):`);
+      for (const o of items) {
+        const item = mdb.prepare('SELECT product_name, quantity FROM order_items WHERE order_id = ?').get(o.id);
+        lines.push(`  • ${o.order_number} — ${item?.product_name || '—'} ×${item?.quantity || 0} — ${o.total_amount} ${company.symbol} — ${phoneUtil.formatForDisplay(o.customer_phone)}`);
+      }
+      lines.push('');
+    }
+
+    await this._reply(jid, lines.join('\n'));
+  }
 
   async _cmdStats(jid) {
     const company = config.company;
@@ -376,7 +421,7 @@ class SupervisorHandler {
     const autoApprove = settings.getBool('auto_approve_orders', false);
     const autoLabel = autoApprove ? '✅ مفعّل' : '❌ معطّل';
 
-    await this.client.sendTypingReply(jid,
+    await this._reply(jid,
       `📊 *التقرير*\n\n` +
       `🛒 الطلبات\n` +
       `  إجمالي: ${today.total || 0}\n` +
@@ -449,7 +494,7 @@ class SupervisorHandler {
         lines.push(`  • ${p.name} — ${p.total_sold} مباع — ${p.stock_quantity} متبقي`);
       }
     }
-    await this.client.sendTypingReply(jid, lines.join('\n'));
+    await this._reply(jid, lines.join('\n'));
   }
 
   async _cmdStock(jid) {
@@ -462,7 +507,7 @@ class SupervisorHandler {
     `).all();
 
     if (!products.length) {
-      return this.client.sendTypingReply(jid, '📦 المخزون فارغ حالياً.');
+      return this._reply(jid, '📦 المخزون فارغ حالياً.');
     }
 
     const company = config.company;
@@ -491,7 +536,7 @@ class SupervisorHandler {
     }
 
     lines.push(`✅ متوفرة: ${totalAvailable} | ❌ غير متوفرة: ${totalOut} | 📦 الإجمالي: ${products.length}`);
-    await this.client.sendTypingReply(jid, lines.join('\n'));
+    await this._reply(jid, lines.join('\n'));
   }
 
   async _cmdLowStock(jid) {
@@ -506,7 +551,7 @@ class SupervisorHandler {
     `).all(threshold);
 
     if (!products.length) {
-      return this.client.sendTypingReply(jid,
+      return this._reply(jid,
         `✅ لا توجد منتجات منخفضة المخزون (الحد: ${threshold} قطعة).`);
     }
 
@@ -518,116 +563,93 @@ class SupervisorHandler {
     }
     lines.push('');
     lines.push(`📦 ${products.length} منتجات تحتاج إعادة تخزين.`);
-    await this.client.sendTypingReply(jid, lines.join('\n'));
+    await this._reply(jid, lines.join('\n'));
+  }
+
+  // ────────────────────────────────────────────────────────────────────
+  // Unified import (file, inline, auto-detect CSV)
+  // ────────────────────────────────────────────────────────────────────
+
+  async _handleImport(jid, supPhone, { text, document }, opts = {}) {
+    try {
+      let rawText = '';
+
+      if (document) {
+        const fileName = (document.fileName || '').toLowerCase();
+        if (!fileName.endsWith('.csv') && !fileName.endsWith('.txt') && !fileName.endsWith('.tsv')) {
+          await this._reply(jid, '⚠️ يرجى إرسال ملف CSV أو TXT أو TSV.');
+          return false;
+        }
+        const response = await fetch(document.url);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        rawText = await response.text();
+        if (!rawText.trim()) {
+          await this._reply(jid, '⚠️ الملف فارغ.');
+          return false;
+        }
+        await this._reply(jid, '⏳ جاري تحليل الملف واستيراد المنتجات...');
+      } else {
+        rawText = text;
+        if (!rawText || !rawText.trim()) return false;
+      }
+
+      const pipeOpts = { actor: supPhone, source: document ? 'file' : 'inline' };
+      if (opts.quick) pipeOpts.skipAI = true;
+
+      const result = await ImportService.importPipeline(rawText, pipeOpts);
+
+      if (!result.imported && !result.updated && !result.skipped) {
+        await this._reply(jid, result.report || '⚠️ لم يتم العثور على بيانات صالحة.');
+        return result.skipped > 0 || result.imported > 0;
+      }
+
+      await this._reply(jid, result.report);
+      logger.info(`Import: ${result.imported} new, ${result.updated} updated, ${result.skipped} skipped`);
+      return true;
+    } catch (err) {
+      logger.error(`Import error: ${err.message}`);
+      if (!opts.quick) await this._reply(jid, `❌ فشل استيراد الملف: ${err.message}`);
+      return false;
+    }
   }
 
   async _cmdImportHelp(jid) {
-    await this.client.sendTypingReply(jid,
+    await this._reply(jid,
       '📄 *استيراد المنتجات*\n\n' +
       'الرجاء إرسال ملف CSV أو كتابة بيانات المنتجات.\n\n' +
-      '*صيغة CSV:*\n' +
-      'name, price, category, stock, unit, description\n\n' +
+      '*الأعمدة المدعومة (عربي وإنجليزي):*\n' +
+      'الاسم, السعر, الفئة, الكمية, الوحدة, الوصف\n\n' +
       '*مثال:*\n' +
       'عطر ورد, 150, عطور, 10, قطعة, عطر فاخر\n' +
       'دهن عود, 350, عود, 5, قطعة, دهن عود كمبودي');
   }
 
-  async _handleDocumentImport(jid, supPhone, document) {
-    const fileName = (document.fileName || '').toLowerCase();
-    if (!fileName.endsWith('.csv')) {
-      return this.client.sendTypingReply(jid,
-        '⚠️ تنسيق الملف غير مدعوم. الرجاء إرسال ملف CSV.\n' +
-        'الأعمدة: name, price, category, stock, unit, description');
-    }
-
-    try {
-      const response = await fetch(document.url);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const csvText = await response.text();
-      if (!csvText.trim()) {
-        return this.client.sendTypingReply(jid, '⚠️ الملف فارغ.');
-      }
-
-      await this.client.sendTypingReply(jid, '⏳ جاري تحليل الملف واستيراد المنتجات...');
-
-      let extracted = null;
-      try {
-        extracted = await AI.askJSON(
-          'Extract products from CSV. Return ONLY a JSON array (no explanation). ' +
-          'Each object: { "name": "string", "price": 0, "category": "string", ' +
-          '"stock": 0, "unit": "قطعة", "description": "" }',
-          csvText.substring(0, 3500),
-          { maxTokens: 3000, temperature: 0.1, maxRetriesOverride: 2 },
-        );
-      } catch (err) {
-        logger.warn(`AI extraction failed, using raw parse: ${err.message}`);
-      }
-
-      const records = (Array.isArray(extracted) && extracted.length)
-        ? extracted
-        : ImportService.parseCSV(csvText);
-
-      if (!records.length) {
-        return this.client.sendTypingReply(jid, '⚠️ لم يتم العثور على منتجات صالحة في الملف.');
-      }
-
-      const result = ImportService.importProducts(records, { actor: supPhone });
-      await this.client.sendTypingReply(jid,
-        `✅ *تم استيراد المنتجات*\n\n` +
-        `📦 المضافة: ${result.imported}\n` +
-        `🔄 المحدّثة: ${result.updated}\n` +
-        `⏭️ المُتخطاة: ${result.skipped}\n` +
-        `📄 الملف: ${document.fileName}\n\n` +
-        `اكتب *مخزون* لعرض المخزون.`);
-      logger.info(`Imported ${result.imported}/${result.updated} products from ${document.fileName}`);
-    } catch (err) {
-      logger.error(`Import error: ${err.message}`);
-      await this.client.sendTypingReply(jid, `❌ فشل استيراد الملف: ${err.message}`);
-    }
-  }
-
-  async _handleInlineImport(jid, supPhone, data) {
-    const records = ImportService.parseCSV(data);
-    if (!records.length) {
-      return this.client.sendTypingReply(jid,
-        '⚠️ تعذر تحليل البيانات. الصيغة:\n' +
-        'اسم المنتج, السعر, الفئة, الكمية, الوحدة, الوصف');
-    }
-    const result = ImportService.importProducts(records, { actor: supPhone });
-    await this.client.sendTypingReply(jid,
-      `✅ *تم استيراد المنتجات*\n` +
-      `📦 المضافة: ${result.imported}\n` +
-      `🔄 المحدّثة: ${result.updated}\n` +
-      `⏭️ المُتخطاة: ${result.skipped}`);
-    logger.info(`Inline import: ${result.imported}/${result.updated} products`);
-  }
-
-  async _tryImportCSV(jid, supPhone, text) {
-    const records = ImportService.parseCSV(text);
-    if (!records.length) return false;
-    const result = ImportService.importProducts(records, { actor: supPhone });
-    await this.client.sendTypingReply(jid,
-      `✅ *تم استيراد ${result.imported + result.updated} منتجات*\n` +
-      `(جديدة: ${result.imported}, محدّثة: ${result.updated})\n` +
-      `اكتب *مخزون* لعرض المخزون.`);
-    return true;
-  }
-
   async _sendHelp(jid) {
+    const mdb = db.getMain();
     const autoApprove = settings.getBool('auto_approve_orders', false);
     const autoLabel = autoApprove ? '✅ مفعّل' : '❌ معطّل';
 
-    await this.client.sendTypingReply(jid,
-      '👋 أهلاً مشرف!\n\n' +
+    const pendingCount = mdb.prepare(
+      `SELECT COUNT(*) AS c FROM orders WHERE status IN ('pending', 'pending_supervisor_approval')`
+    ).get()?.c || 0;
+
+    const todayCount = mdb.prepare(
+      `SELECT COUNT(*) AS c FROM orders WHERE date(created_at) = date('now')`
+    ).get()?.c || 0;
+
+    await this._reply(jid,
+      `👋 أهلاً مشرف!\n\n` +
+      `📌 ${pendingCount} طلبات معلقة | 🛒 ${todayCount} طلبات اليوم | ⚙️ ${autoLabel}\n\n` +
       '*الأوامر المتاحة:*\n' +
       '🔹 *طلبات* — عرض الطلبات المعلقة\n' +
+      '🔹 *جميع الطلبات* — عرض كل الطلبات\n' +
       '🔹 *حالة ORD-xxxxx* — تفاصيل طلب\n' +
       '🔹 *موافقة ORD-xxxxx* — موافقة\n' +
       '🔹 *رفض ORD-xxxxx* [سبب] — رفض\n' +
       '🔹 *تعيين ORD-xxxxx <رقم>* [ملاحظة] — تعيين مندوب\n' +
       '🔹 *توصيل ORD-xxxxx* — بدء التوصيل\n' +
       '🔹 *إنهاء ORD-xxxxx* — إكمال الطلب\n' +
-      '🔹 *تلقائي* — تبديل القبول التلقائي (' + autoLabel + ')\n' +
+      '🔹 *تلقائي* — تبديل القبول التلقائي\n' +
       '🔹 *تقرير* — إحصائيات اليوم\n' +
       '🔹 *تقرير مفصل* — تقرير يومي كامل\n' +
       '🔹 *مخزون* — عرض المخزون\n' +

@@ -4,6 +4,7 @@ const config = require('../config/company.config');
 const logger = require('../utils/logger');
 const AI = require('../ai/AIService');
 const ProductService = require('../services/ProductService');
+const Search = require('../services/SearchService');
 const CatalogGenerator = require('../generators/CatalogGenerator');
 const Order = require('../services/OrderService');
 const Customer = require('../services/CustomerService');
@@ -297,14 +298,18 @@ class CustomerHandler {
   async _handleInquiry(jid, conv, text) {
     const extraction = await AI.extractOrder(text);
     const query = extraction?.items?.[0]?.productName || text;
-    const results = ProductService.searchAll(query);
+    const { results, method } = Search.hybridSearch(query);
 
     if (!results.length) {
+      const suggestions = Search.suggestAlternatives(query);
       const cats = ProductService.getAllCategories().map((c) => c.name).join(' | ');
-      return this._reply(jid, conv,
-        `لم أجد نتائج لـ "${query}".\n\n` +
-        (cats ? `📂 *الفئات:* ${cats}\n\n` : '') +
-        'اكتب *منتجات* لعرض الكتالوج، أو اسم منتج آخر للبحث.');
+      let reply = `لم أجد نتائج لـ "${query}".\n\n`;
+      if (cats) reply += `📂 *الفئات:* ${cats}\n\n`;
+      if (suggestions.length) {
+        reply += `💡 *هل تقصد:* ${suggestions.join(' | ')}\n\n`;
+      }
+      reply += 'اكتب *منتجات* لعرض الكتالوج، أو اسم منتج آخر للبحث.';
+      return this._reply(jid, conv, reply);
     }
 
     const lines = [`🔍 *نتائج "${query}":*`, ''];
@@ -336,9 +341,14 @@ class CustomerHandler {
     for (const raw of extraction.items) {
       if (!raw.productName) continue;
       const qty = sanitize.clampQuantity(raw.quantity || 1);
-      const product = ProductService.bestMatch(raw.productName);
+      const product = Search.bestMatch(raw.productName);
       if (!product) {
-        unresolved.push({ name: raw.productName, qty });
+        const suggestions = Search.suggestAlternatives(raw.productName);
+        let msg = `لم أجد "${raw.productName}".`;
+        if (suggestions.length) {
+          msg += `\n💡 هل تقصد: *${suggestions.join(' | ')}*؟`;
+        }
+        unresolved.push({ name: raw.productName, qty, suggestions: suggestions.join(' | ') });
         continue;
       }
       resolved.push({
@@ -349,8 +359,12 @@ class CustomerHandler {
     }
 
     if (!resolved.length) {
+      const suggestionLines = unresolved
+        .filter((u) => u.suggestions)
+        .map((u) => `💡 بدلاً من "${u.name}" هل تقصد: *${u.suggestions}*؟`);
       return this._reply(jid, conv,
         'لم أجد المنتجات التي ذكرتها.\n' +
+        (suggestionLines.length ? suggestionLines.join('\n') + '\n' : '') +
         'اكتب *منتجات* لعرض الكتالوج أو اكتب اسم المنتج بدقة.');
     }
 

@@ -29,13 +29,13 @@ class ProductService {
       SELECT p.*, c.name AS category_name
         FROM products p
         LEFT JOIN categories c ON p.category_id = c.id
-       WHERE (p.name LIKE ? OR p.sku LIKE ? OR p.barcode = ? OR p.description LIKE ?)
+       WHERE (p.name LIKE ? OR p.name_ar LIKE ? OR p.sku LIKE ? OR p.barcode = ? OR p.description LIKE ?)
        ORDER BY p.is_available DESC,
                 CASE WHEN p.stock_quantity > 0 THEN 0 ELSE 1 END,
                 p.total_sold DESC,
                 p.name ASC
        LIMIT 5
-    `).all(like, like, query, like);
+    `).all(like, like, like, query, like);
   }
 
   /**
