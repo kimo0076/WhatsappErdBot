@@ -83,6 +83,9 @@ class SupervisorHandler {
     if (!input) return null;
     const order = Order.getByNumberFlexible(input);
     return order ? order.order_number : null;
+  }
+
+  // ────────────────────────────────────────────────────────────────────
   // Reply helper
   // ────────────────────────────────────────────────────────────────────
 
