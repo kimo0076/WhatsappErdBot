@@ -4,6 +4,7 @@ const OpenAI = require('openai');
 const logger = require('../utils/logger');
 const db = require('../database/connection');
 const settings = require('../utils/settings');
+const config = require('../config/company.config');
 
 /**
  * AI gateway. Uses OpenCode Go's OpenAI-compatible endpoint.
@@ -64,57 +65,73 @@ class AIService {
     const c = this.company;
     if (!c) return 'You are a helpful assistant for a business.';
 
-    // Load top products for context-aware sales suggestions
+    // Load products from catalog (cached 60s)
     let productContext = '';
-    try {
-      const products = db.getProducts().prepare(`
-        SELECT p.name, COALESCE(p.discount_price, p.price) AS price,
-               COALESCE(p.name_ar, '') AS name_ar, p.stock_quantity, c2.name AS category
-          FROM products p
-          LEFT JOIN categories c2 ON p.category_id = c2.id
-         WHERE p.is_available = 1
-         ORDER BY p.total_sold DESC LIMIT 8
-      `).all();
-      if (products.length) {
-        productContext = '\nالمنتجات المتوفرة:\n' +
-          products.map((p) =>
-            `- ${p.name}${p.name_ar ? ' (' + p.name_ar + ')' : ''} — ${p.price} ${c.symbol || 'ر.س'} [${p.category || 'عام'}] — ${p.stock_quantity > 0 ? 'متوفر' : 'غير متوفر'}`
-          ).join('\n');
-      }
-    } catch (_) { /* DB not ready yet */ }
+    const now = Date.now();
+    if (!this._catalogCache || (now - this._catalogCacheTime) > 60000) {
+      try {
+        this._catalogCache = db.getProducts().prepare(`
+          SELECT p.name, COALESCE(p.name_ar, '') AS name_ar, COALESCE(p.discount_price, p.price) AS price,
+                 p.stock_quantity, c2.name AS category
+            FROM products p
+            LEFT JOIN categories c2 ON p.category_id = c2.id
+           WHERE p.is_available = 1
+           ORDER BY p.total_sold DESC LIMIT 30
+        `).all();
+        this._catalogCacheTime = now;
+      } catch (_) { this._catalogCache = []; }
+    }
+    const products = this._catalogCache || [];
+    if (products.length) {
+      const lines = products.map((p) =>
+        `- ${p.name}${p.name_ar ? ' (' + p.name_ar + ')' : ''} — ${p.price} ${c.symbol || 'ر.س'} [${p.category || 'عام'}] — ${p.stock_quantity > 0 ? 'متوفر' : 'غير متوفر'}`
+      );
+      let text = lines.join('\n');
+      if (text.length > 2500) text = text.substring(0, 2500) + '\n... والمزيد';
+      productContext = '\nالمنتجات المتوفرة:\n' + text;
+    }
 
-    const categories = [];
+    const cats = [];
     try {
-      const cats = db.getProducts().prepare(
-        'SELECT name FROM categories WHERE is_active = 1 AND id != 1 ORDER BY sort_order LIMIT 5'
-      ).all();
-      cats.forEach((cat) => categories.push(cat.name));
-    } catch (_) { /* DB not ready yet */ }
+      db.getProducts().prepare(
+        'SELECT name FROM categories WHERE is_active = 1 AND id != 1 ORDER BY sort_order LIMIT 6'
+      ).all().forEach((r) => cats.push(r.name));
+    } catch (_) {}
+
+    const supNames = (config.supervisors || []).map((s) => s.name).join('، ') || 'المشرف';
+    const whStart = settings.get('working_hours_start') || '09:00';
+    const whEnd = settings.get('working_hours_end') || '22:00';
 
     return `أنت موظف مبيعات محترف في متجر "${c.name}".
 المجال: ${c.domain || 'عام'}
 العملة: ${c.symbol || 'ر.س'}
 المدينة: ${c.city || ''}
 اللغة: العربية
+مواعيد العمل: من ${whStart} إلى ${whEnd}
 
 شخصيتك:
-- ودود ومبادر — مثل مندوب مبيعات في أفضل محل ${c.domain || ' '}
+- ودود ومبادر — مثل أفضل مندوب مبيعات
 - خبير بمنتجات المتجر وتساعد العميل في اختيار الأنسب
-- تقترح منتجات بشكل استباقي بناءً على اهتمامات العميل
-- إذا سأل العميل عن منتج غير موجود، تقترح بدائل مشابهة من نفس الفئة
-- إذا كان المنتج غير متوفر بالمخزون، تعرض منتجاً بديلاً متوفراً
+- تقترح منتجات بديلة إذا كان المنتج المطلوب غير متوفر
+- إذا سأل العميل عن منتج غير موجود في القائمة، قل: "للأسف هذا المنتج غير متوفر حالياً. هل تفضل تجربة {اقترح بديل من نفس الفئة}؟"
 
 ${productContext || ''}
 
-الفئات: ${categories.length ? categories.join(' | ') : 'عام'}
+الفئات: ${cats.length ? cats.join(' | ') : 'عام'}
 
-قواعد مهمة:
-- ردودك قصيرة ومفيدة (4-5 أسطر)
-- استخدم الإيموجي باعتدال 🌹✨
+معلومات تشغيلية:
+- للتواصل مع مشرف: "${supNames}"
+- التوصيل متاح في ${c.city || 'جميع المدن'}. يرجى مشاركة موقعك لتحديد العنوان.
+- أوقات الدوام: من ${whStart} إلى ${whEnd}
+
+قواعد صارمة (ممنوع مخالفتها):
+- لا تتحدث أبداً عن: السياسة، الدين، الرياضة، الطب، القانون، التقنية، البرمجة
 - لا تخترع منتجات غير موجودة في القائمة أعلاه
-- لا تخترع أسعاراً دقيقة لمنتجات غير موجودة — قل: "سأتحقق لك من السعر"
-- إذا سأل العميل عن شيء خارج المجال، اشرح له بلطف تخصصك ثم اسأله عن اهتمامه بالعطور
-- في نهاية كل رد، اسأل سؤالاً مفتوحاً يشجع العميل على الاستمرار`;
+- لا تخترع أسعاراً — استخدم الأسعار من القائمة فقط
+- إذا سأل العميل عن شيء خارج نطاق ${c.domain || 'العطور'}، قل: "أنا متخصص فقط في ${c.domain || 'مجالنا'}. كيف أقدر أساعدك اليوم؟"
+- ردودك مختصرة ومفيدة (4-5 أسطر)
+- استخدم الإيموجي باعتدال 🌹✨
+- اختتم كل رد بسؤال مفتوح يشجع العميل على الاستمرار`;
   }
 
   async chat(messages, options = {}) {
@@ -210,9 +227,50 @@ ${productContext || ''}
     ];
 
     const res = await this.chat(messages);
+    const filtered = this._filterResponse(res.text);
     this._saveTurn(sessionId, 'user', userMessage);
-    this._saveTurn(sessionId, 'assistant', res.text);
-    return res;
+    this._saveTurn(sessionId, 'assistant', filtered);
+    return { ...res, text: filtered };
+  }
+
+  _filterResponse(text) {
+    if (!text) return text;
+
+    // Off-topic guardrail — check for forbidden topics
+    const offTopicRE = /سياسة|دين|رياضه|رياضة|طب|قانون|حرب|انتخاب|برمجه|برمجة|تقنيه|تقنية|كمبيوتر|صحه|صحة|دواء|كوره|كرة|افلام|أفلام|موسيقى|سياره|سيارة/i;
+    const matches = (text.match(offTopicRE) || []);
+    if (matches.length >= 3) {
+      const oos = (config.messages && config.messages.outOfScope)
+        ? config.messages.outOfScope
+            .replace('{companyName}', (this.company && this.company.name) || 'المتجر')
+            .replace('{domain}', (this.company && this.company.domain) || 'مجالنا')
+        : `أنا متخصص فقط في ${(this.company && this.company.domain) || 'مجالنا'}. كيف أقدر أساعدك اليوم؟ 🌹`;
+      logger.info('AI guardrail: off-topic response filtered');
+      return oos;
+    }
+
+    // Product name verification — strip invented products
+    try {
+      const known = new Set();
+      db.getProducts().prepare('SELECT name, COALESCE(name_ar, \'\') AS name_ar FROM products').all()
+        .forEach((p) => { known.add(p.name.toLowerCase()); if (p.name_ar) known.add(p.name_ar.toLowerCase()); });
+
+      const lines = text.split('\n');
+      const filtered = lines.map((line) => {
+        // Check if any known product appears in this line — if yes, keep it
+        for (const name of known) {
+          if (name.length > 2 && line.toLowerCase().includes(name)) return line;
+        }
+        // If line has a price pattern (number + currency) but no known product, strip price
+        if (/\d+\s*(ر\.س|SAR|ريال)/.test(line) && ![...known].some((n) => n.length > 2 && line.toLowerCase().includes(n))) {
+          return line.replace(/\d+\s*(ر\.س|SAR|ريال)/g, '--- ر.س');
+        }
+        return line;
+      });
+      text = filtered.join('\n');
+    } catch (_) { /* DB not ready, skip product verification */ }
+
+    return text;
   }
 
   clearHistory(sessionId) {

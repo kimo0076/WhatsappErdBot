@@ -106,6 +106,7 @@ class CustomerHandler {
 
     let intent;
     try {
+      await this._reply(jid, conv, '⏳ لحظة من فضلك... ✨');
       intent = await AI.classifyIntent(text);
       logger.info(`  Intent [${phone}]: ${intent}`);
     } catch (err) {
@@ -738,6 +739,7 @@ class CustomerHandler {
   async _handleGeneralReply(jid, conv, phone, text) {
     try {
       const sessionId = `sess_${phone}_${conv.session_id}`;
+      await this._reply(jid, conv, '⏳ لحظة من فضلك... ✨');
       const res = await AI.generateReply(sessionId, text);
       await this._reply(jid, conv, res.text);
     } catch (err) {
