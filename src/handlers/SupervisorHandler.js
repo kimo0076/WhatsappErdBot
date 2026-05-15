@@ -15,8 +15,8 @@ const {
 } = require('../utils/constants');
 
 // Bug #6: More flexible order number regex
-// Accepts: ORD-20260515-003, ord-20260515-003, 003-20260515, ORD-20260515-003
-const ORDER_NUMBER_RE = /(ord-\d{8}-\d{3}|\d{3}-\d{8})/i;
+// Accepts: ORD-20260515-003, 003-20260515, 003-20260515-ORD, ORD-20260515-003
+const ORDER_NUMBER_RE = /(ord-?\d{8}-\d{3}|\d{3,8}[-\s]\d{3,8}(?:-(?:\d{3}|ord))?)/i;
 const PHONE_RE = /(\+\d{7,15}|\d{7,15})/;
 
 /**
@@ -128,24 +128,24 @@ class SupervisorHandler {
         run: (jid, phone) => this._cmdAutoApprove(jid, phone) },
 
       // Bug #6: Flexible order number matching
-      { name: 'approve', match: captured(/^(?:approve|\/approve|موافقة)\s+((?:ord-?)?\d{3,8}[-\s]?\d{3,8}(?:-\d{3})?)$/i),
+      { name: 'approve', match: captured(/^(?:approve|\/approve|موافقة)\s+((?:ord-?)?\d{3,8}[-\s]?\d{3,8}(?:-(?:\d{3}|ord))?)$/i),
         run: (jid, phone, [orderInput]) => this._cmdApprove(jid, phone, orderInput) },
 
-      { name: 'reject', match: captured(/^(?:reject|\/reject|رفض)\s+((?:ord-?)?\d{3,8}[-\s]?\d{3,8}(?:-\d{3})?)(?:\s+(?:السبب\s+)?(.+))?$/i),
+      { name: 'reject', match: captured(/^(?:reject|\/reject|رفض)\s+((?:ord-?)?\d{3,8}[-\s]?\d{3,8}(?:-(?:\d{3}|ord))?)\s*(?:\s+(.+))?$/i),
         run: (jid, phone, [orderInput, reason]) =>
           this._cmdReject(jid, phone, orderInput, reason || null) },
 
-      { name: 'status', match: captured(/^(?:status|\/status|حالة|تفاصيل)\s+((?:ord-?)?\d{3,8}[-\s]?\d{3,8}(?:-\d{3})?)$/i),
+      { name: 'status', match: captured(/^(?:status|\/status|حالة|تفاصيل)\s+((?:ord-?)?\d{3,8}[-\s]?\d{3,8}(?:-(?:\d{3}|ord))?)$/i),
         run: (jid, phone, [orderInput]) => this._cmdStatus(jid, orderInput) },
 
-      { name: 'deliver', match: captured(/^(?:deliver|\/deliver|توصيل|شحن)\s+((?:ord-?)?\d{3,8}[-\s]?\d{3,8}(?:-\d{3})?)$/i),
+      { name: 'deliver', match: captured(/^(?:deliver|\/deliver|توصيل|شحن)\s+((?:ord-?)?\d{3,8}[-\s]?\d{3,8}(?:-(?:\d{3}|ord))?)$/i),
         run: (jid, phone, [orderInput]) => this._cmdDeliver(jid, phone, orderInput) },
 
-      { name: 'complete', match: captured(/^(?:complete|\/complete|مكتمل|انهاء|إنهاء)\s+((?:ord-?)?\d{3,8}[-\s]?\d{3,8}(?:-\d{3})?)$/i),
+      { name: 'complete', match: captured(/^(?:complete|\/complete|مكتمل|انهاء|إنهاء)\s+((?:ord-?)?\d{3,8}[-\s]?\d{3,8}(?:-(?:\d{3}|ord))?)$/i),
         run: (jid, phone, [orderInput]) => this._cmdComplete(jid, phone, orderInput) },
 
       { name: 'assign',
-        match: captured(/^(?:assign|\/assign|تعيين)\s+((?:ord-?)?\d{3,8}[-\s]?\d{3,8}(?:-\d{3})?)\s+(\+?\d{7,15})(?:\s+(.+))?$/i),
+        match: captured(/^(?:assign|\/assign|تعيين)\s+((?:ord-?)?\d{3,8}[-\s]?\d{3,8}(?:-(?:\d{3}|ord))?)\s+(\+?\d{7,15})(?:\s+(.+))?$/i),
         run: (jid, phone, [orderInput, delPhone, notes]) =>
           this._cmdAssign(jid, phone, orderInput,
             delPhone.startsWith('+') ? delPhone : '+' + delPhone, notes || null) },
