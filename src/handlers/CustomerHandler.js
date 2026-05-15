@@ -714,7 +714,12 @@ class CustomerHandler {
   // ────────────────────────────────────────────────────────────────────
 
   _matches(lower, list) {
-    return list.some((kw) => lower === kw);
+    return list.some((kw) => {
+      if (lower === kw) return true;
+      if (kw.includes(' ') && lower.includes(kw)) return true;
+      const words = lower.split(/\s+/);
+      return words.includes(kw) || lower.startsWith(kw + ' ');
+    });
   }
 
   async _reply(jid, conv, text) {

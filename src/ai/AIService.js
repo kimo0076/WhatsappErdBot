@@ -25,6 +25,22 @@ class AIService {
     this.maxRetries = parseInt(process.env.AI_MAX_RETRIES, 10) || 3;
     this.timeout = parseInt(process.env.AI_TIMEOUT, 10) || 15000;
     this.company = null;
+
+    // Periodic cleanup of old conversation memory
+    const HOUR = 60 * 60 * 1000;
+    setInterval(() => this._pruneMemory(), 6 * HOUR).unref();
+  }
+
+  _pruneMemory() {
+    try {
+      const ttl = settings.getInt('ai_memory_ttl_hours', 72);
+      const r = db.getMain().prepare(`
+        DELETE FROM ai_memory WHERE created_at < datetime('now', '-' || ? || ' hours')
+      `).run(ttl);
+      if (r.changes > 0) logger.info(`AI memory pruned: ${r.changes} rows`);
+    } catch (err) {
+      logger.warn(`AI memory prune failed: ${err.message}`);
+    }
   }
 
   get client() {

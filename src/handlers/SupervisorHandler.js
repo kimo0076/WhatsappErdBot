@@ -163,12 +163,12 @@ class SupervisorHandler {
           this._cmdAssign(jid, phone, orderInput,
             delPhone ? (delPhone.startsWith('+') ? delPhone : '+' + delPhone) : null, notes || null) },
 
+      { name: 'importHelp', match: exact(/^(import|\/import|استيراد)$/i),
+        run: (jid) => this._cmdImportHelp(jid) },
+
       { name: 'importInline',
         match: captured(/^(?:import|\/import|استيراد)\s+([\s\S]+)$/i),
         run: (jid, phone, [data]) => this._handleImport(jid, phone, { text: data }) },
-
-      { name: 'importHelp', match: exact(/^(import|\/import|استيراد)$/i),
-        run: (jid) => this._cmdImportHelp(jid) },
     ];
   }
 
@@ -353,7 +353,7 @@ class SupervisorHandler {
       SELECT o.*, c.phone_number AS customer_phone
         FROM orders o JOIN customers c ON o.customer_id = c.id
        WHERE date(o.created_at) = date('now')
-         AND o.status != 'cancelled'
+         AND o.status != '${ORDER_STATUS.CANCELLED}'
        ORDER BY o.created_at DESC LIMIT 30
     `).all();
 
@@ -365,8 +365,8 @@ class SupervisorHandler {
     const groups = { pending: [], confirmed: [], in_transit: [], completed: [] };
 
     for (const o of orders) {
-      const status = o.status === 'pending_supervisor_approval' ? 'pending' : o.status;
-      const key = status === 'location_collected' ? 'confirmed' : status;
+      const status = o.status === ORDER_STATUS.PENDING_APPROVAL ? 'pending' : o.status;
+      const key = status === ORDER_STATUS.LOCATION_COLLECTED ? 'confirmed' : status;
       if (groups[key]) groups[key].push(o);
     }
 
@@ -379,13 +379,26 @@ class SupervisorHandler {
       { key: 'completed', emoji: '🏁', label: 'مكتملة' },
     ];
 
+    // Batch-fetch all order items in one query
+    const orderIds = orders.map((o) => o.id);
+    const itemMap = {};
+    if (orderIds.length) {
+      const placeholders = orderIds.map(() => '?').join(',');
+      const allItems = mdb.prepare(
+        `SELECT order_id, product_name, quantity FROM order_items WHERE order_id IN (${placeholders})`
+      ).all(...orderIds);
+      for (const it of allItems) {
+        if (!itemMap[it.order_id]) itemMap[it.order_id] = it;
+      }
+    }
+
     for (const sec of sections) {
       const items = groups[sec.key];
       if (!items.length) continue;
       lines.push(`${sec.emoji} *${sec.label}* (${items.length}):`);
       for (const o of items) {
-        const item = mdb.prepare('SELECT product_name, quantity FROM order_items WHERE order_id = ?').get(o.id);
-        lines.push(`  • ${o.order_number} — ${item?.product_name || '—'} ×${item?.quantity || 0} — ${o.total_amount} ${company.symbol} — ${phoneUtil.formatForDisplay(o.customer_phone)}`);
+        const it = itemMap[o.id];
+        lines.push(`  • ${o.order_number} — ${it?.product_name || '—'} ×${it?.quantity || 0} — ${o.total_amount} ${company.symbol} — ${phoneUtil.formatForDisplay(o.customer_phone)}`);
       }
       lines.push('');
     }
@@ -401,10 +414,10 @@ class SupervisorHandler {
     const today = mdb.prepare(`
       SELECT
         COUNT(*) AS total,
-        SUM(CASE WHEN status IN ('pending', 'pending_supervisor_approval') THEN 1 ELSE 0 END) AS pending,
-        SUM(CASE WHEN status IN ('confirmed', 'in_transit', 'delivered', 'completed') THEN 1 ELSE 0 END) AS active,
-        SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
-        COALESCE(SUM(CASE WHEN status != 'cancelled' THEN total_amount ELSE 0 END), 0) AS revenue
+        SUM(CASE WHEN status IN ('${ORDER_STATUS.PENDING}', '${ORDER_STATUS.PENDING_APPROVAL}') THEN 1 ELSE 0 END) AS pending,
+        SUM(CASE WHEN status IN ('${ORDER_STATUS.CONFIRMED}', '${ORDER_STATUS.IN_TRANSIT}', '${ORDER_STATUS.DELIVERED}', '${ORDER_STATUS.COMPLETED}') THEN 1 ELSE 0 END) AS active,
+        SUM(CASE WHEN status = '${ORDER_STATUS.CANCELLED}' THEN 1 ELSE 0 END) AS cancelled,
+        COALESCE(SUM(CASE WHEN status != '${ORDER_STATUS.CANCELLED}' THEN total_amount ELSE 0 END), 0) AS revenue
       FROM orders WHERE date(created_at) = date('now')
     `).get();
 
@@ -446,10 +459,10 @@ class SupervisorHandler {
     const orders = mdb.prepare(`
       SELECT
         COUNT(*) AS total,
-        COALESCE(SUM(CASE WHEN status != 'cancelled' THEN total_amount END), 0) AS revenue,
-        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed,
-        SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
-        SUM(CASE WHEN status IN ('pending', 'pending_supervisor_approval') THEN 1 ELSE 0 END) AS pending
+        COALESCE(SUM(CASE WHEN status != '${ORDER_STATUS.CANCELLED}' THEN total_amount END), 0) AS revenue,
+        SUM(CASE WHEN status = '${ORDER_STATUS.COMPLETED}' THEN 1 ELSE 0 END) AS completed,
+        SUM(CASE WHEN status = '${ORDER_STATUS.CANCELLED}' THEN 1 ELSE 0 END) AS cancelled,
+        SUM(CASE WHEN status IN ('${ORDER_STATUS.PENDING}', '${ORDER_STATUS.PENDING_APPROVAL}') THEN 1 ELSE 0 END) AS pending
       FROM orders WHERE date(created_at) = date('now')
     `).get();
 
@@ -630,7 +643,7 @@ class SupervisorHandler {
     const autoLabel = autoApprove ? '✅ مفعّل' : '❌ معطّل';
 
     const pendingCount = mdb.prepare(
-      `SELECT COUNT(*) AS c FROM orders WHERE status IN ('pending', 'pending_supervisor_approval')`
+      `SELECT COUNT(*) AS c FROM orders WHERE status IN ('${ORDER_STATUS.PENDING}', '${ORDER_STATUS.PENDING_APPROVAL}')`
     ).get()?.c || 0;
 
     const todayCount = mdb.prepare(

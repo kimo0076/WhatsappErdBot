@@ -16,10 +16,10 @@ class ProductService {
         LEFT JOIN categories c ON p.category_id = c.id
        WHERE p.is_available = 1
          AND p.stock_quantity > 0
-         AND (p.name LIKE ? OR p.sku LIKE ? OR p.barcode = ? OR p.description LIKE ?)
+         AND (p.name LIKE ? OR p.name_ar LIKE ? OR p.sku LIKE ? OR p.barcode = ? OR p.description LIKE ?)
        ORDER BY p.total_sold DESC, p.name ASC
        LIMIT 5
-    `).all(like, like, query, like);
+    `).all(like, like, like, query, like);
   }
 
   searchAll(query) {
