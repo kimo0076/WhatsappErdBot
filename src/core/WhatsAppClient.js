@@ -14,12 +14,21 @@ const qrcode = require('qrcode-terminal');
 const path = require('path');
 const fs = require('fs');
 const logger = require('../utils/logger');
+const phoneUtil = require('../utils/phone');
 
+/**
+ * Anti-ban posture inspired by Baileys community guidance:
+ *   - typing presence before each send,
+ *   - small randomized delay scaled by message length,
+ *   - stable browser fingerprint,
+ *   - markOnlineOnConnect=false / syncFullHistory=false to avoid burst
+ *     traffic on reconnect.
+ */
 const ANTI_BAN_CONFIG = {
   minTypingDelay: 1500,
   maxTypingDelay: 4000,
   browser: ['WhatsApp Bot', 'Chrome', '114.0.0'],
-  maxReconnectAttempts: 5,
+  maxReconnectAttempts: Number(process.env.WA_MAX_RECONNECT) || 10,
   reconnectDelay: 3000,
 };
 
@@ -32,7 +41,7 @@ function randomDelay(min, max) {
 }
 
 const baileysLogger = pino({
-  level: process.env.LOG_LEVEL || 'silent',
+  level: process.env.BAILEYS_LOG_LEVEL || 'silent',
   transport:
     process.env.NODE_ENV === 'development'
       ? { target: 'pino-pretty', options: { colorize: true } }
@@ -63,12 +72,9 @@ function extractLocation(message) {
 }
 
 function extractContact(message) {
-  const contact = message?.contactMessage;
-  if (!contact) return null;
-  return {
-    displayName: contact.displayName || null,
-    vcard: contact.vcard || null,
-  };
+  const c = message?.contactMessage;
+  if (!c) return null;
+  return { displayName: c.displayName || null, vcard: c.vcard || null };
 }
 
 function extractDocument(message) {
@@ -85,23 +91,37 @@ function extractDocument(message) {
 class WhatsAppClient {
   constructor() {
     this.sock = null;
-    this.authFolder = path.join(process.cwd(), process.env.WA_SESSION_PATH || './data/auth_info');
-    this.messageHandler = null;
+    this.authFolder = path.join(
+      process.cwd(),
+      process.env.WA_SESSION_PATH || './data/auth_info',
+    );
   }
 
-  async sendTypingReply(jid, text) {
+  /**
+   * Send a text message with typing indicator and a length-scaled delay.
+   * Retries once on transient send failures.
+   */
+  async sendTypingReply(jid, text, attempt = 1) {
+    if (!this.sock) {
+      logger.warn('sendTypingReply called before socket is ready.');
+      return null;
+    }
     try {
-      await this.sock.sendPresenceUpdate('composing', jid);
+      await this.sock.sendPresenceUpdate('composing', jid).catch(() => {});
       const delay = Math.min(
-        ANTI_BAN_CONFIG.minTypingDelay + text.length * 30,
+        ANTI_BAN_CONFIG.minTypingDelay + (text?.length || 0) * 30,
         ANTI_BAN_CONFIG.maxTypingDelay,
       );
       await randomDelay(ANTI_BAN_CONFIG.minTypingDelay, delay);
       const result = await this.sock.sendMessage(jid, { text });
-      await this.sock.sendPresenceUpdate('available', jid);
+      this.sock.sendPresenceUpdate('available', jid).catch(() => {});
       return result;
     } catch (err) {
-      logger.error('Send error: ' + err.message);
+      logger.error(`Send error (attempt ${attempt}) to ${jid}: ${err.message}`);
+      if (attempt < 2) {
+        await randomDelay(800, 1500);
+        return this.sendTypingReply(jid, text, attempt + 1);
+      }
       return null;
     }
   }
@@ -115,6 +135,10 @@ class WhatsAppClient {
       logger.error('Send location error: ' + err.message);
       return null;
     }
+  }
+
+  normalizeJid(phone) {
+    return phoneUtil.normalizeJid(phone);
   }
 
   async connect(handleMessage) {
@@ -146,33 +170,30 @@ class WhatsAppClient {
 
     this.sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
       if (qr) {
-        console.log('\n📱 Scan QR Code to login:\n');
+        console.log('\nScan QR Code to login:\n');
         qrcode.generate(qr, { small: true });
       }
-
       if (connection === 'close') {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-
         logger.warn(`Connection closed (status ${statusCode}). Reconnect: ${shouldReconnect}`);
 
         if (shouldReconnect && reconnectCount < ANTI_BAN_CONFIG.maxReconnectAttempts) {
           reconnectCount++;
-          setTimeout(() => this.connect(handleMessage), ANTI_BAN_CONFIG.reconnectDelay);
+          // Exponential-ish backoff capped at 60s.
+          const delay = Math.min(60_000, ANTI_BAN_CONFIG.reconnectDelay * reconnectCount);
+          setTimeout(() => this.connect(handleMessage), delay);
         } else if (!shouldReconnect) {
           logger.warn('Logged out. Delete auth_info/ and restart.');
         }
       }
-
       if (connection === 'open') {
         reconnectCount = 0;
-        logger.info('✅ WhatsApp connected.');
+        logger.info('WhatsApp connected.');
       }
     });
 
     this.sock.ev.on('creds.update', saveCreds);
-
-    this.processedMessageIds = new Set();
 
     this.sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify') return;
@@ -180,14 +201,6 @@ class WhatsAppClient {
       for (const msg of messages) {
         if (!msg.message) continue;
         if (msg.key.fromMe) continue;
-
-        // Skip duplicate messages (Baileys retries after decryption failures)
-        if (this.processedMessageIds.has(msg.key.id)) continue;
-        this.processedMessageIds.add(msg.key.id);
-        if (this.processedMessageIds.size > 1000) {
-          const first = this.processedMessageIds.values().next().value;
-          this.processedMessageIds.delete(first);
-        }
 
         const jid = msg.key.remoteJid;
         const userId = jidNormalizedUser(jid);
@@ -202,7 +215,7 @@ class WhatsAppClient {
           jid,
           userId,
           isGroup,
-          text: text.trim(),
+          text: (text || '').trim(),
           location,
           contact,
           document,
@@ -219,11 +232,6 @@ class WhatsAppClient {
     });
 
     return this.sock;
-  }
-
-  normalizeJid(phone) {
-    if (phone.includes('@')) return phone;
-    return phone + '@s.whatsapp.net';
   }
 }
 
