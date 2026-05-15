@@ -1,0 +1,29 @@
+# ── WhatsappErdBot — docker-compose ─────────────────────────────
+
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    container_name: whatsapp-erd-bot
+    restart: unless-stopped
+    ports:
+      - "3099:3099"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - LOG_LEVEL=info
+      - MAIN_DB_PATH=/app/data/database/main.db
+      - PRODUCTS_DB_PATH=/app/data/database/products.db
+      - WA_SESSION_PATH=/app/data/auth_info
+      - HEALTH_PORT=3099
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3099/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

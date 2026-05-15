@@ -88,6 +88,11 @@ const { migrate } = require('./database/migrate');
 
   Scheduler.start(wa);
 
+  // Health check server
+  const HealthServer = require('./infrastructure/HealthServer');
+  const health = new HealthServer({ port: parseInt(process.env.HEALTH_PORT) || 3099 });
+  health.start();
+
   try {
     await wa.connect(async (event) => handler.handle(event));
     logger.info(`${config.company.name} — bot online.`);
@@ -103,6 +108,7 @@ const { migrate } = require('./database/migrate');
     logger.info(`${signal} received — shutting down gracefully...`);
     try { Scheduler.stop(); } catch (_) { /* noop */ }
     try { handler.shutdown && handler.shutdown(); } catch (_) { /* noop */ }
+    try { health.stop(); } catch (_) { /* noop */ }
     try { db.close(); } catch (_) { /* noop */ }
     setTimeout(() => process.exit(0), 200);
   };

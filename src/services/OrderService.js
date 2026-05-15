@@ -5,6 +5,8 @@ const config = require('../config/company.config');
 const logger = require('../utils/logger');
 const Inventory = require('./InventoryService');
 const Customer = require('./CustomerService');
+const EventBus = require('../infrastructure/EventBus');
+const { EVENTS } = require('../infrastructure/EventBus');
 const {
   ORDER_STATUS,
   ORDER_ITEM_STATUS,
@@ -344,11 +346,81 @@ class OrderService {
       }
     }
 
-    return { ok: true, order: this.getByNumber(orderNumber), deducted };
+    const resolved = this.getByNumber(orderNumber);
+    EventBus.emit(EVENTS.ORDER_CONFIRMED, {
+      orderId: resolved.id, orderNumber, tenant: config.company.phone,
+    });
+    return { ok: true, order: resolved, deducted };
   }
 
-  reject(orderNumber, supervisorPhone, reason) {
-    return this._cancelInternal(null, orderNumber, reason || 'rejected_by_supervisor', supervisorPhone, 'order_rejected');
+  cancel(orderNumber, actorPhone, reason) {
+    return this._cancelInternal(null, orderNumber, reason || 'cancelled', actorPhone, 'order_cancelled');
+  }
+
+  _cancelInternal(orderIdOrNull, orderNumber, reason, actorPhone, actionLabel = 'order_cancelled') {
+    const mdb = db.getMain();
+    const order = orderIdOrNull
+      ? mdb.prepare(`
+          SELECT o.*, c.phone_number, c.whatsapp_jid
+            FROM orders o JOIN customers c ON o.customer_id = c.id
+           WHERE o.id = ?
+        `).get(orderIdOrNull)
+      : this.getByNumber(orderNumber);
+
+    if (!order) return { ok: false, reason: 'NOT_FOUND' };
+    if (order.status === ORDER_STATUS.CANCELLED) return { ok: false, reason: 'ALREADY_CANCELLED' };
+
+    const items = this.getItems(order.id);
+
+    // If we already deducted stock (any non-backorder/non-cancelled item), restock.
+    const wasDeducted = order.status !== ORDER_STATUS.PENDING_APPROVAL;
+    const restockable = wasDeducted
+      ? items
+        .filter((it) => it.product_id && it.status !== ORDER_ITEM_STATUS.BACKORDER && it.status !== ORDER_ITEM_STATUS.CANCELLED)
+        .map((it) => ({ productId: it.product_id, quantity: it.quantity }))
+      : [];
+
+    if (restockable.length) {
+      try {
+        Inventory.restockForOrder(restockable, {
+          orderId: order.id,
+          orderNumber: order.order_number || orderNumber,
+          reason: actionLabel === 'order_rejected' ? 'cancel_order' : 'cancel_order',
+          createdBy: actorPhone,
+        });
+      } catch (err) {
+        logger.warn(`Restock on cancel failed: ${err.message}`);
+      }
+    }
+
+    db.txMain(() => {
+      mdb.prepare(`
+        UPDATE orders
+           SET status = ?, cancellation_reason = ?, cancelled_at = CURRENT_TIMESTAMP
+         WHERE id = ?
+      `).run(ORDER_STATUS.CANCELLED, reason, order.id);
+
+      mdb.prepare(
+        'UPDATE order_items SET status = ? WHERE order_id = ?'
+      ).run(ORDER_ITEM_STATUS.CANCELLED, order.id);
+
+      mdb.prepare(`
+        INSERT INTO activity_log (action, entity_type, entity_id, user_phone, details)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(actionLabel, 'order', order.id, actorPhone,
+        JSON.stringify({ orderNumber: order.order_number || orderNumber, reason }));
+    });
+
+    const resolved = this.getByNumber(order.order_number || orderNumber);
+    EventBus.emit(EVENTS.ORDER_CANCELLED, {
+      orderId: resolved.id,
+      orderNumber: resolved.order_number,
+      tenant: config.company.phone,
+      cancelledBy: actorPhone,
+      reason,
+    });
+
+    return { ok: true, order: resolved };
   }
 
   cancel(orderNumber, actorPhone, reason) {
@@ -433,6 +505,9 @@ class OrderService {
       `).run('order_in_transit', 'order', order.id, actorPhone,
         JSON.stringify({ orderNumber }));
     });
+    EventBus.emit(EVENTS.ORDER_IN_TRANSIT, {
+      orderId: order.id, orderNumber, tenant: config.company.phone,
+    });
     return { ok: true, order: this.getByNumber(orderNumber) };
   }
 
@@ -459,6 +534,10 @@ class OrderService {
       `).run('order_completed', 'order', order.id, actorPhone,
         JSON.stringify({ orderNumber }));
     });
+
+    EventBus.emit(EVENTS.ORDER_COMPLETED, {
+      orderId: order.id, orderNumber, tenant: config.company.phone,
+    });
     return { ok: true, order: this.getByNumber(orderNumber) };
   }
 
@@ -481,6 +560,9 @@ class OrderService {
         VALUES (?, ?, ?, ?, ?)
       `).run('order_assigned', 'order', order.id, actorPhone,
         JSON.stringify({ orderNumber, deliveryPhone, notes: notes || null }));
+    });
+    EventBus.emit(EVENTS.ORDER_DELIVERY_ASSIGNED, {
+      orderId: order.id, orderNumber, tenant: config.company.phone, deliveryPhone,
     });
     return { ok: true, order: this.getByNumber(orderNumber) };
   }

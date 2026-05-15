@@ -1,0 +1,14 @@
+# ── WhatsappErdBot — .dockerignore ──────────────────────────────
+
+node_modules/
+.git/
+.gitignore
+data/
+logs/
+.env
+*.db
+auth_info/
+.DS_Store
+*.md
+docker-compose.yml
+Dockerfile
