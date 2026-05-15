@@ -14,7 +14,9 @@ const {
   STATUS_LABELS_AR,
 } = require('../utils/constants');
 
-const ORDER_NUMBER_RE = /(ord-\d{8}-\d{3})/i;
+// Bug #6: More flexible order number regex
+// Accepts: ORD-20260515-003, ord-20260515-003, 003-20260515, ORD-20260515-003
+const ORDER_NUMBER_RE = /(ord-\d{8}-\d{3}|\d{3}-\d{8})/i;
 const PHONE_RE = /(\+\d{7,15}|\d{7,15})/;
 
 /**
@@ -74,6 +76,13 @@ class SupervisorHandler {
   }
 
   // ────────────────────────────────────────────────────────────────────
+  // Helper: resolve flexible order number to canonical form
+  // ────────────────────────────────────────────────────────────────────
+
+  _resolveOrderNumber(input) {
+    if (!input) return null;
+    const order = Order.getByNumberFlexible(input);
+    return order ? order.order_number : null;
   // Reply helper
   // ────────────────────────────────────────────────────────────────────
 
@@ -111,26 +120,31 @@ class SupervisorHandler {
       { name: 'lowStock', match: exact(/^(lowstock|\/lowstock|ناقص|منخفض|تنبيه)$/i),
         run: (jid) => this._cmdLowStock(jid) },
 
-      { name: 'approve', match: captured(/^(?:approve|\/approve|موافقة)\s+(ord-\d{8}-\d{3})$/i),
-        run: (jid, phone, [orderNo]) => this._cmdApprove(jid, phone, orderNo.toUpperCase()) },
+      // Bug #5: Auto-approve toggle command
+      { name: 'autoApprove', match: exact(/^(تلقائي|auto|\/auto|auto.?approve)$/i),
+        run: (jid, phone) => this._cmdAutoApprove(jid, phone) },
 
-      { name: 'reject', match: captured(/^(?:reject|\/reject|رفض)\s+(ord-\d{8}-\d{3})(?:\s+(.+))?$/i),
-        run: (jid, phone, [orderNo, reason]) =>
-          this._cmdReject(jid, phone, orderNo.toUpperCase(), reason || null) },
+      // Bug #6: Flexible order number matching
+      { name: 'approve', match: captured(/^(?:approve|\/approve|موافقة)\s+((?:ord-?)?\d{3,8}[-\s]?\d{3,8}(?:-\d{3})?)$/i),
+        run: (jid, phone, [orderInput]) => this._cmdApprove(jid, phone, orderInput) },
 
-      { name: 'status', match: captured(/^(?:status|\/status|حالة|تفاصيل)\s+(ord-\d{8}-\d{3})$/i),
-        run: (jid, phone, [orderNo]) => this._cmdStatus(jid, orderNo.toUpperCase()) },
+      { name: 'reject', match: captured(/^(?:reject|\/reject|رفض)\s+((?:ord-?)?\d{3,8}[-\s]?\d{3,8}(?:-\d{3})?)(?:\s+(?:السبب\s+)?(.+))?$/i),
+        run: (jid, phone, [orderInput, reason]) =>
+          this._cmdReject(jid, phone, orderInput, reason || null) },
 
-      { name: 'deliver', match: captured(/^(?:deliver|\/deliver|توصيل|شحن)\s+(ord-\d{8}-\d{3})$/i),
-        run: (jid, phone, [orderNo]) => this._cmdDeliver(jid, phone, orderNo.toUpperCase()) },
+      { name: 'status', match: captured(/^(?:status|\/status|حالة|تفاصيل)\s+((?:ord-?)?\d{3,8}[-\s]?\d{3,8}(?:-\d{3})?)$/i),
+        run: (jid, phone, [orderInput]) => this._cmdStatus(jid, orderInput) },
 
-      { name: 'complete', match: captured(/^(?:complete|\/complete|مكتمل|انهاء|إنهاء)\s+(ord-\d{8}-\d{3})$/i),
-        run: (jid, phone, [orderNo]) => this._cmdComplete(jid, phone, orderNo.toUpperCase()) },
+      { name: 'deliver', match: captured(/^(?:deliver|\/deliver|توصيل|شحن)\s+((?:ord-?)?\d{3,8}[-\s]?\d{3,8}(?:-\d{3})?)$/i),
+        run: (jid, phone, [orderInput]) => this._cmdDeliver(jid, phone, orderInput) },
+
+      { name: 'complete', match: captured(/^(?:complete|\/complete|مكتمل|انهاء|إنهاء)\s+((?:ord-?)?\d{3,8}[-\s]?\d{3,8}(?:-\d{3})?)$/i),
+        run: (jid, phone, [orderInput]) => this._cmdComplete(jid, phone, orderInput) },
 
       { name: 'assign',
-        match: captured(/^(?:assign|\/assign|تعيين)\s+(ord-\d{8}-\d{3})\s+(\+?\d{7,15})(?:\s+(.+))?$/i),
-        run: (jid, phone, [orderNo, delPhone, notes]) =>
-          this._cmdAssign(jid, phone, orderNo.toUpperCase(),
+        match: captured(/^(?:assign|\/assign|تعيين)\s+((?:ord-?)?\d{3,8}[-\s]?\d{3,8}(?:-\d{3})?)\s+(\+?\d{7,15})(?:\s+(.+))?$/i),
+        run: (jid, phone, [orderInput, delPhone, notes]) =>
+          this._cmdAssign(jid, phone, orderInput,
             delPhone.startsWith('+') ? delPhone : '+' + delPhone, notes || null) },
 
       { name: 'importInline',
@@ -141,6 +155,7 @@ class SupervisorHandler {
         run: (jid) => this._cmdImportHelp(jid) },
     ];
   }
+
 
   // ────────────────────────────────────────────────────────────────────
   // Commands
@@ -173,7 +188,26 @@ class SupervisorHandler {
     await this.client.sendTypingReply(jid, lines.join('\n'));
   }
 
-  async _cmdApprove(jid, supPhone, orderNumber) {
+  // Bug #5: Auto-approve toggle
+  async _cmdAutoApprove(jid, phone) {
+    const current = settings.getBool('auto_approve_orders', false);
+    const newValue = !current;
+    settings.set('auto_approve_orders', newValue ? 'true' : 'false');
+
+    const statusText = newValue
+      ? '✅ *تم تفعيل القبول التلقائي*\n\nالطلبات الجديدة ستُقبل تلقائياً بدون الحاجة لموافقة المشرف (ما لم يكن المخزون غير كافٍ).'
+      : '❌ *تم إيقاف القبول التلقائي*\n\nالطلبات التي تحتاج مراجعة ستنتظر موافقة المشرف.';
+
+    logger.info(`Auto-approve toggled to ${newValue} by ${phone}`);
+    await this.client.sendTypingReply(jid, statusText);
+  }
+
+  async _cmdApprove(jid, supPhone, orderInput) {
+    const orderNumber = this._resolveOrderNumber(orderInput);
+    if (!orderNumber) {
+      return this.client.sendTypingReply(jid, `❌ الطلب "${orderInput}" غير موجود.`);
+    }
+
     const r = Order.approve(orderNumber, supPhone);
     if (!r.ok) {
       const reasonMap = {
@@ -195,7 +229,12 @@ class SupervisorHandler {
     }
   }
 
-  async _cmdReject(jid, supPhone, orderNumber, reason) {
+  async _cmdReject(jid, supPhone, orderInput, reason) {
+    const orderNumber = this._resolveOrderNumber(orderInput);
+    if (!orderNumber) {
+      return this.client.sendTypingReply(jid, `❌ الطلب "${orderInput}" غير موجود.`);
+    }
+
     const r = Order.reject(orderNumber, supPhone, reason);
     if (!r.ok) {
       const reasonMap = {
@@ -216,7 +255,12 @@ class SupervisorHandler {
     }
   }
 
-  async _cmdStatus(jid, orderNumber) {
+  async _cmdStatus(jid, orderInput) {
+    const orderNumber = this._resolveOrderNumber(orderInput);
+    if (!orderNumber) {
+      return this.client.sendTypingReply(jid, `❌ الطلب "${orderInput}" غير موجود.`);
+    }
+
     const order = Order.getByNumber(orderNumber);
     if (!order) {
       return this.client.sendTypingReply(jid, `❌ الطلب ${orderNumber} غير موجود.`);
@@ -246,7 +290,12 @@ class SupervisorHandler {
     await this.client.sendTypingReply(jid, lines.join('\n'));
   }
 
-  async _cmdDeliver(jid, supPhone, orderNumber) {
+  async _cmdDeliver(jid, supPhone, orderInput) {
+    const orderNumber = this._resolveOrderNumber(orderInput);
+    if (!orderNumber) {
+      return this.client.sendTypingReply(jid, `❌ الطلب "${orderInput}" غير موجود.`);
+    }
+
     const r = Order.markInTransit(orderNumber, supPhone);
     if (!r.ok) return this._sendOrderError(jid, orderNumber, r.reason);
     await this.client.sendTypingReply(jid, `🚚 تم تحديث الطلب ${orderNumber} — قيد التوصيل.`);
@@ -257,7 +306,12 @@ class SupervisorHandler {
     }
   }
 
-  async _cmdComplete(jid, supPhone, orderNumber) {
+  async _cmdComplete(jid, supPhone, orderInput) {
+    const orderNumber = this._resolveOrderNumber(orderInput);
+    if (!orderNumber) {
+      return this.client.sendTypingReply(jid, `❌ الطلب "${orderInput}" غير موجود.`);
+    }
+
     const r = Order.complete(orderNumber, supPhone);
     if (!r.ok) return this._sendOrderError(jid, orderNumber, r.reason);
     await this.client.sendTypingReply(jid, `🏁 تم إكمال الطلب ${orderNumber}.`);
@@ -268,7 +322,12 @@ class SupervisorHandler {
     }
   }
 
-  async _cmdAssign(jid, supPhone, orderNumber, deliveryPhone, notes) {
+  async _cmdAssign(jid, supPhone, orderInput, deliveryPhone, notes) {
+    const orderNumber = this._resolveOrderNumber(orderInput);
+    if (!orderNumber) {
+      return this.client.sendTypingReply(jid, `❌ الطلب "${orderInput}" غير موجود.`);
+    }
+
     const r = Order.assignDelivery(orderNumber, supPhone, deliveryPhone, notes);
     if (!r.ok) return this._sendOrderError(jid, orderNumber, r.reason);
     await this.client.sendTypingReply(jid,
@@ -284,6 +343,7 @@ class SupervisorHandler {
     };
     return this.client.sendTypingReply(jid, map[reason] || `❌ ${reason}`);
   }
+
 
   async _cmdStats(jid) {
     const company = config.company;
@@ -310,6 +370,9 @@ class SupervisorHandler {
       FROM products WHERE is_available = 1
     `).get(threshold);
 
+    const autoApprove = settings.getBool('auto_approve_orders', false);
+    const autoLabel = autoApprove ? '✅ مفعّل' : '❌ معطّل';
+
     await this.client.sendTypingReply(jid,
       `📊 *التقرير*\n\n` +
       `🛒 الطلبات\n` +
@@ -322,7 +385,8 @@ class SupervisorHandler {
       `  إجمالي: ${inv.total || 0}\n` +
       `  متوفرة: ${inv.available || 0}\n` +
       `  ⚠️ منخفضة: ${inv.low || 0}\n` +
-      `  ❌ غير متوفرة: ${inv.out_of_stock || 0}`);
+      `  ❌ غير متوفرة: ${inv.out_of_stock || 0}\n\n` +
+      `⚙️ القبول التلقائي: ${autoLabel}`);
   }
 
   async _cmdReport(jid) {
@@ -547,6 +611,9 @@ class SupervisorHandler {
   }
 
   async _sendHelp(jid) {
+    const autoApprove = settings.getBool('auto_approve_orders', false);
+    const autoLabel = autoApprove ? '✅ مفعّل' : '❌ معطّل';
+
     await this.client.sendTypingReply(jid,
       '👋 أهلاً مشرف!\n\n' +
       '*الأوامر المتاحة:*\n' +
@@ -557,6 +624,7 @@ class SupervisorHandler {
       '🔹 *تعيين ORD-xxxxx <رقم>* [ملاحظة] — تعيين مندوب\n' +
       '🔹 *توصيل ORD-xxxxx* — بدء التوصيل\n' +
       '🔹 *إنهاء ORD-xxxxx* — إكمال الطلب\n' +
+      '🔹 *تلقائي* — تبديل القبول التلقائي (' + autoLabel + ')\n' +
       '🔹 *تقرير* — إحصائيات اليوم\n' +
       '🔹 *تقرير مفصل* — تقرير يومي كامل\n' +
       '🔹 *مخزون* — عرض المخزون\n' +
