@@ -296,19 +296,30 @@ class CustomerHandler {
   }
 
   async _handleInquiry(jid, conv, text) {
+    await this._reply(jid, conv, '⏳ لحظة من فضلك... جاري البحث عن المنتج 🔍');
     const extraction = await AI.extractOrder(text);
     const query = extraction?.items?.[0]?.productName || text;
     const { results, method } = Search.hybridSearch(query);
 
     if (!results.length) {
       const suggestions = Search.suggestAlternatives(query);
+      const topSelling = ProductService.getTopSelling(3);
       const cats = ProductService.getAllCategories().map((c) => c.name).join(' | ');
-      let reply = `لم أجد نتائج لـ "${query}".\n\n`;
-      if (cats) reply += `📂 *الفئات:* ${cats}\n\n`;
+
+      let reply = `لم أجد "${query}" حالياً 🌹\n\n`;
       if (suggestions.length) {
         reply += `💡 *هل تقصد:* ${suggestions.join(' | ')}\n\n`;
       }
-      reply += 'اكتب *منتجات* لعرض الكتالوج، أو اسم منتج آخر للبحث.';
+      if (topSelling.length) {
+        reply += `⭐ *الأكثر طلباً اليوم:*\n`;
+        topSelling.forEach((p) => {
+          const price = p.discount_price || p.price;
+          reply += `  • ${p.name} — ${price} ${config.company.symbol}\n`;
+        });
+        reply += '\n';
+      }
+      if (cats) reply += `📂 *الفئات:* ${cats}\n\n`;
+      reply += 'هل يعجبك أحد هذه المنتجات؟ اكتب *منتجات* لعرض الكتالوج الكامل.';
       return this._reply(jid, conv, reply);
     }
 
@@ -323,12 +334,28 @@ class CustomerHandler {
       lines.push(`   📦 ${stockEmoji} ${p.stock_quantity > 0 ? 'متوفر' : 'غير متوفر'}`);
       lines.push('');
     });
+
+    // Proactive suggestion: show top product from same category
+    if (results[0]?.category_name) {
+      const related = ProductService.getByCategory(results[0].category_name, 2)
+        .filter((p) => !results.some((r) => r.id === p.id));
+      if (related.length) {
+        lines.push(`⭐ *قد يعجبك أيضاً من فئة ${results[0].category_name}:*`);
+        related.forEach((p) => {
+          const rp = p.discount_price || p.price;
+          lines.push(`  • ${p.name} — ${rp} ${company.symbol}`);
+        });
+        lines.push('');
+      }
+    }
+
     lines.push('للطلب: اكتب *اسم المنتج* مع الكمية المطلوبة.');
     await this._reply(jid, conv, lines.join('\n'));
   }
 
 
   async _handleOrderIntent(jid, conv, phone, text) {
+    await this._reply(jid, conv, '⏳ لحظة من فضلك... جاري تجهيز طلبك 🛒');
     const extraction = await AI.extractOrder(text);
     if (!extraction || !extraction.hasOrder || !Array.isArray(extraction.items) || !extraction.items.length) {
       return this._handleGeneralReply(jid, conv, phone, text);
@@ -525,6 +552,19 @@ class CustomerHandler {
     lines.push('');
     lines.push('📍 *الرجاء مشاركة موقعك* لتحديد عنوان التوصيل.');
     lines.push('يمكنك إرسال موقعك عبر واتساب أو كتابة العنوان يدوياً.');
+
+    // Post-order up-sell: suggest top-selling product
+    try {
+      const top = ProductService.getTopSelling(2)
+        .filter((p) => !items.some((it) => it.product_name === p.name))
+        .slice(0, 1);
+      if (top.length) {
+        const p = top[0];
+        const price = p.discount_price || p.price;
+        lines.push('');
+        lines.push(`💡 *بالمناسبة، جرب أيضاً:* ${p.name} — ${price} ${company.symbol}`);
+      }
+    } catch (_) { /* ignore */ }
 
     await this._reply(jid, conv, lines.join('\n'));
   }

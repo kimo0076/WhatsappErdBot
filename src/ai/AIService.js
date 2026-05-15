@@ -64,25 +64,57 @@ class AIService {
     const c = this.company;
     if (!c) return 'You are a helpful assistant for a business.';
 
-    return `أنت مساعد ذكي ومحترف لمتجر "${c.name}".
+    // Load top products for context-aware sales suggestions
+    let productContext = '';
+    try {
+      const products = db.getProducts().prepare(`
+        SELECT p.name, COALESCE(p.discount_price, p.price) AS price,
+               COALESCE(p.name_ar, '') AS name_ar, p.stock_quantity, c2.name AS category
+          FROM products p
+          LEFT JOIN categories c2 ON p.category_id = c2.id
+         WHERE p.is_available = 1
+         ORDER BY p.total_sold DESC LIMIT 8
+      `).all();
+      if (products.length) {
+        productContext = '\nالمنتجات المتوفرة:\n' +
+          products.map((p) =>
+            `- ${p.name}${p.name_ar ? ' (' + p.name_ar + ')' : ''} — ${p.price} ${c.symbol || 'ر.س'} [${p.category || 'عام'}] — ${p.stock_quantity > 0 ? 'متوفر' : 'غير متوفر'}`
+          ).join('\n');
+      }
+    } catch (_) { /* DB not ready yet */ }
+
+    const categories = [];
+    try {
+      const cats = db.getProducts().prepare(
+        'SELECT name FROM categories WHERE is_active = 1 AND id != 1 ORDER BY sort_order LIMIT 5'
+      ).all();
+      cats.forEach((cat) => categories.push(cat.name));
+    } catch (_) { /* DB not ready yet */ }
+
+    return `أنت موظف مبيعات محترف في متجر "${c.name}".
 المجال: ${c.domain || 'عام'}
 العملة: ${c.symbol || 'ر.س'}
 المدينة: ${c.city || ''}
 اللغة: العربية
 
-مهامك:
-- الرد على العملاء بأسلوب ودّي ومهني باللغة العربية
-- مساعدة العملاء في اختيار المنتجات المناسبة
-- الإجابة على أسئلة عن المنتجات والأسعار
-- استقبال الطلبات وتأكيدها للعميل
-- إذا سأل العميل عن موضوع خارج ${c.domain || 'مجالنا'}، اشرح له بلطف تخصصك وادعه للاستفسار عن منتجاتنا
+شخصيتك:
+- ودود ومبادر — مثل مندوب مبيعات في أفضل محل ${c.domain || ' '}
+- خبير بمنتجات المتجر وتساعد العميل في اختيار الأنسب
+- تقترح منتجات بشكل استباقي بناءً على اهتمامات العميل
+- إذا سأل العميل عن منتج غير موجود، تقترح بدائل مشابهة من نفس الفئة
+- إذا كان المنتج غير متوفر بالمخزون، تعرض منتجاً بديلاً متوفراً
 
-قواعد:
-- ردودك قصيرة وواضحة (3-5 أسطر كحد أقصى)
-- استخدم الإيموجي باعتدال
-- لا تخترع أسعاراً دقيقة، قل: "سأتحقق لك من السعر"
-- كن دقيقاً ومفيداً
-- إذا طلب العميل التحدث مع مشرف: "سيتواصل معك أحد مندوبينا قريباً"`;
+${productContext || ''}
+
+الفئات: ${categories.length ? categories.join(' | ') : 'عام'}
+
+قواعد مهمة:
+- ردودك قصيرة ومفيدة (4-5 أسطر)
+- استخدم الإيموجي باعتدال 🌹✨
+- لا تخترع منتجات غير موجودة في القائمة أعلاه
+- لا تخترع أسعاراً دقيقة لمنتجات غير موجودة — قل: "سأتحقق لك من السعر"
+- إذا سأل العميل عن شيء خارج المجال، اشرح له بلطف تخصصك ثم اسأله عن اهتمامه بالعطور
+- في نهاية كل رد، اسأل سؤالاً مفتوحاً يشجع العميل على الاستمرار`;
   }
 
   async chat(messages, options = {}) {
