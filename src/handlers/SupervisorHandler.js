@@ -35,7 +35,7 @@ class SupervisorHandler {
     const { jid, text, document } = event;
 
     if (document) {
-      logger.info(`Supervisor [${phone}]: importing ${document.fileName}`);
+      logger.info(`  📄 Supervisor [${phone}]: importing ${document.fileName}`);
       return this._handleDocumentImport(jid, phone, document);
     }
 
@@ -45,30 +45,33 @@ class SupervisorHandler {
     for (const cmd of this._commands) {
       const m = cmd.match(lower);
       if (m) {
+        logger.info(`  🤖 Supervisor [${phone}]: ${cmd.name}`);
         try {
           await cmd.run(jid, phone, m, text);
         } catch (err) {
           logger.error(`Supervisor command "${cmd.name}" failed: ${err.message}`);
-          await this.client.sendTypingReply(jid,
-            `حدث خطأ أثناء تنفيذ الأمر: ${err.message}`);
+          await this._reply(jid, `حدث خطأ أثناء تنفيذ الأمر: ${err.message}`);
         }
         return;
       }
     }
 
     // Detect partial commands missing an order number.
-    if (/^(حالة|موافقة|رفض|توصيل|تعيين|انهاء|إنهاء)\b/i.test(lower)) {
-      return this.client.sendTypingReply(jid,
+    if (/^(حالة|موافقة|رفض|توصيل|تعيين|انهاء|إنهاء)$/i.test(lower)) {
+      logger.info(`  ℹ️ Supervisor [${phone}]: partial command`);
+      return this._reply(jid,
         '⚠️ الرجاء إدخال رقم الطلب مع الأمر.\n' +
         'مثال: *موافقة ORD-20260515-001*');
     }
 
     // Detect ad-hoc CSV pasted as a single message.
     if ((text.match(/,/g) || []).length >= 2) {
+      logger.info(`  📄 Supervisor [${phone}]: possible CSV data`);
       const handled = await this._tryImportCSV(jid, phone, text);
       if (handled) return;
     }
 
+    logger.info(`  👋 Supervisor [${phone}]: help`);
     return this._sendHelp(jid);
   }
 
@@ -80,6 +83,14 @@ class SupervisorHandler {
     if (!input) return null;
     const order = Order.getByNumberFlexible(input);
     return order ? order.order_number : null;
+  // Reply helper
+  // ────────────────────────────────────────────────────────────────────
+
+  async _reply(jid, text) {
+    const result = await this.client.sendTypingReply(jid, text);
+    const preview = text.replace(/\n/g, ' ').substring(0, 60);
+    logger.info(`  Replied supervisor [${jid}]: ${preview}…`);
+    return result;
   }
 
   // ────────────────────────────────────────────────────────────────────
