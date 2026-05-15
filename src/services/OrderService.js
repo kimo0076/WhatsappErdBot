@@ -239,6 +239,39 @@ class OrderService {
     `).all(ORDER_STATUS.PENDING, ORDER_STATUS.PENDING_APPROVAL, limit);
   }
 
+  listByCustomerPhone(phone, limit = 10) {
+    return db.getMain().prepare(`
+      SELECT o.*, c.phone_number
+        FROM orders o
+        JOIN customers c ON o.customer_id = c.id
+       WHERE c.phone_number = ?
+       ORDER BY o.created_at DESC
+       LIMIT ?
+    `).all(phone, limit);
+  }
+
+  getByNumberFlexible(input) {
+    // Try exact match first
+    let order = this.getByNumber(input.toUpperCase());
+    if (order) return order;
+
+    // Try reconstructing: "003-20260515" → "ORD-20260515-003"
+    const prefix = (config.orders?.orderPrefix || 'ORD').toUpperCase();
+    const m = input.match(/(\d{3})-(\d{8})/);
+    if (m) {
+      order = this.getByNumber(`${prefix}-${m[2]}-${m[1]}`);
+      if (order) return order;
+    }
+
+    // Try with prefix added
+    if (!input.toUpperCase().startsWith(prefix)) {
+      order = this.getByNumber(`${prefix}-${input}`.toUpperCase());
+      if (order) return order;
+    }
+
+    return null;
+  }
+
   // ────────────────────────────────────────────────────────────────────
   // Transitions
   // ────────────────────────────────────────────────────────────────────

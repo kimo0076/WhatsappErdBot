@@ -10,15 +10,22 @@ const Customer = require('../services/CustomerService');
 const Conversation = require('../services/ConversationService');
 const phoneUtil = require('../utils/phone');
 const sanitize = require('../utils/sanitize');
+const settings = require('../utils/settings');
 const {
   ORDER_STATUS,
   CONVERSATION_STATE,
   SENDER_TYPE,
+  STATUS_LABELS_AR,
 } = require('../utils/constants');
 const { StockError } = require('../utils/errors');
 
 const YES_PATTERN = /^(نعم|yes|ok|اوك|أوك|موافق|تمام|يس|اي|أي|اكيد|أكيد|مؤكد|تأكيد|ايوه|أيوه)$/i;
 const NO_PATTERN = /^(لا|no|إلغاء|الغاء|كانسل|cancel)$/i;
+
+// Fast-path keyword patterns (Bug #7: avoid slow AI calls)
+const ORDER_STATUS_KEYWORDS = /^(طلباتي|طلبي|ماهي طلباتي|حالة طلبي|ماهي الطلبات التي لدي|وش الطلبات|وذ الطلبات|طلباتي السابقة|اريد اعرف طلباتي|عرض طلباتي)$/i;
+const GREETING_KEYWORDS = /^(سلام|مرحبا|مرحباً|هلا|اهلا|أهلا|هاي|hi|hello|السلام عليكم|صباح الخير|مساء الخير)$/i;
+const ORDER_NUMBER_PATTERN = /(?:ord-?\d{8}-?\d{3}|\d{3}-\d{8})/i;
 
 class CustomerHandler {
   constructor(client) {
@@ -42,8 +49,25 @@ class CustomerHandler {
         if (handled) return;
       }
       if (fresh.current_state === CONVERSATION_STATE.AWAITING_LOCATION) {
-        await this._handleLocationInput(jid, conv, phone, text, fresh);
-        return;
+        // Bug #3 & #8: Validate order is NOT cancelled before accepting location
+        const stateData = Conversation.parseStateData(fresh);
+        const { orderId } = stateData.awaitingLocation || {};
+        if (orderId) {
+          const orderCheck = Order.getItems(orderId);
+          const orderRow = require('../database/connection').getMain()
+            .prepare('SELECT status FROM orders WHERE id = ?').get(orderId);
+          if (!orderRow || orderRow.status === ORDER_STATUS.CANCELLED) {
+            // Order was cancelled (e.g. rejected by supervisor). Reset state and continue normal flow.
+            Conversation.resetState(conv.id);
+            logger.info(`Order ${orderId} is cancelled, resetting awaiting_location state for ${phone}`);
+            // Fall through to normal message processing below
+          } else {
+            await this._handleLocationInput(jid, conv, phone, text, fresh);
+            return;
+          }
+        } else {
+          Conversation.resetState(conv.id);
+        }
       }
     }
 
@@ -53,6 +77,21 @@ class CustomerHandler {
     }
 
     const lower = text.trim().toLowerCase();
+
+    // Bug #7: Fast-path keyword detection BEFORE AI classification
+    if (ORDER_STATUS_KEYWORDS.test(lower)) {
+      return this._handleMyOrders(jid, conv, phone);
+    }
+
+    if (GREETING_KEYWORDS.test(lower)) {
+      return this._handleGreeting(jid, conv);
+    }
+
+    // Check if user sent an order number — look it up directly
+    const orderNumMatch = text.match(ORDER_NUMBER_PATTERN);
+    if (orderNumMatch) {
+      return this._handleOrderLookup(jid, conv, phone, orderNumMatch[0]);
+    }
 
     if (this._matches(lower, ['منتجات', 'المنتجات', 'عرض المنتجات', 'catalog'])) {
       return this._sendCatalog(jid, conv, phone);
@@ -93,6 +132,7 @@ class CustomerHandler {
     }
   }
 
+
   // ────────────────────────────────────────────────────────────────────
   // Specific intents
   // ────────────────────────────────────────────────────────────────────
@@ -103,6 +143,21 @@ class CustomerHandler {
     if (location) {
       const fresh = Conversation.getById(conv.id);
       if (fresh.current_state === CONVERSATION_STATE.AWAITING_LOCATION) {
+        // Bug #3 & #8: Validate order is NOT cancelled before accepting location
+        const stateData = Conversation.parseStateData(fresh);
+        const { orderId } = stateData.awaitingLocation || {};
+        if (orderId) {
+          const orderRow = require('../database/connection').getMain()
+            .prepare('SELECT status FROM orders WHERE id = ?').get(orderId);
+          if (!orderRow || orderRow.status === ORDER_STATUS.CANCELLED) {
+            Conversation.resetState(conv.id);
+            logger.info(`Order ${orderId} cancelled, ignoring location share for ${phone}`);
+            await this._reply(jid, conv,
+              'تم استلام موقعك 📍 لكن لا يوجد طلب نشط حالياً.\n' +
+              'اكتب اسم المنتج أو *منتجات* لعرض الكتالوج.');
+            return;
+          }
+        }
         await this._handleLocationShare(jid, conv, phone, location, fresh);
         return;
       }
@@ -146,6 +201,67 @@ class CustomerHandler {
       '4️⃣ اكتب طلبك مباشرة (مثال: أريد عطر شانيل ٣ حبات)';
 
     await this._reply(jid, conv, reply);
+  }
+
+  // Bug #2: Handle "my orders" query by looking up DB
+  async _handleMyOrders(jid, conv, phone) {
+    const orders = Order.listByCustomerPhone(phone, 10);
+    if (!orders.length) {
+      return this._reply(jid, conv,
+        '📋 لا توجد لديك طلبات سابقة حالياً.\n\nاكتب *منتجات* لعرض الكتالوج وبدء طلب جديد.');
+    }
+
+    const company = config.company;
+    const lines = ['📋 *طلباتك:*', ''];
+    for (const o of orders) {
+      const statusLabel = STATUS_LABELS_AR[o.status] || o.status;
+      const statusEmoji = o.status === ORDER_STATUS.CANCELLED ? '❌'
+        : o.status === ORDER_STATUS.COMPLETED ? '✅'
+        : o.status === ORDER_STATUS.IN_TRANSIT ? '🚚'
+        : '🔄';
+      lines.push(`${statusEmoji} *${o.order_number}*`);
+      lines.push(`   💰 ${o.total_amount} ${company.symbol} — ${statusLabel}`);
+      lines.push(`   🕐 ${o.created_at}`);
+      lines.push('');
+    }
+    lines.push('لمعرفة تفاصيل طلب، أرسل رقم الطلب.');
+    await this._reply(jid, conv, lines.join('\n'));
+  }
+
+  // Bug #2: Handle order number lookup from customer
+  async _handleOrderLookup(jid, conv, phone, input) {
+    const order = Order.getByNumberFlexible(input);
+    if (!order) {
+      return this._reply(jid, conv,
+        `❌ لم أجد طلباً برقم "${input}".\n\nاكتب *طلباتي* لعرض طلباتك.`);
+    }
+
+    // Verify this order belongs to the customer
+    if (order.phone_number !== phone) {
+      return this._reply(jid, conv,
+        '❌ هذا الطلب لا يخصك.\n\nاكتب *طلباتي* لعرض طلباتك.');
+    }
+
+    const items = Order.getItems(order.id);
+    const company = config.company;
+    const statusLabel = STATUS_LABELS_AR[order.status] || order.status;
+
+    const lines = [
+      `🔍 *تفاصيل الطلب ${order.order_number}*`,
+      '',
+      `📌 الحالة: ${statusLabel}`,
+      '',
+      '📦 *المنتجات:*',
+    ];
+    items.forEach((it) => {
+      lines.push(`   • ${it.product_name} — ${it.quantity}x × ${it.unit_price} ${company.symbol}`);
+    });
+    lines.push('');
+    lines.push(`💰 الإجمالي: ${order.total_amount} ${company.symbol}`);
+    if (order.delivery_address) lines.push(`📍 العنوان: ${order.delivery_address}`);
+    lines.push(`🕐 تاريخ الطلب: ${order.created_at}`);
+
+    await this._reply(jid, conv, lines.join('\n'));
   }
 
   async _sendCatalog(jid, conv, phone) {
@@ -205,6 +321,7 @@ class CustomerHandler {
     lines.push('للطلب: اكتب *اسم المنتج* مع الكمية المطلوبة.');
     await this._reply(jid, conv, lines.join('\n'));
   }
+
 
   async _handleOrderIntent(jid, conv, phone, text) {
     const extraction = await AI.extractOrder(text);
@@ -330,14 +447,27 @@ class CustomerHandler {
     }
 
     try {
+      // Bug #5: Check auto_approve_orders setting
+      const autoApprove = settings.getBool('auto_approve_orders', false);
+      const isBackorder = pending.backorder;
+
       const result = Order.create({
         customerId: fresh.customer_id,
         customerPhone: phone,
         conversationId: conv.id,
         items: pending.items,
         customerMessage: text,
-        backorder: pending.backorder,
+        backorder: autoApprove ? false : isBackorder,
       });
+
+      // If auto-approve is on and this was a backorder, force confirm
+      if (autoApprove && isBackorder) {
+        try {
+          Order.approve(result.order.order_number, 'auto_approve');
+        } catch (e) {
+          logger.warn(`Auto-approve failed for ${result.order.order_number}: ${e.message}`);
+        }
+      }
 
       Conversation.setState(conv.id, CONVERSATION_STATE.AWAITING_LOCATION, {
         awaitingLocation: {
@@ -346,8 +476,9 @@ class CustomerHandler {
         },
       });
 
-      await this._sendOrderConfirmation(jid, conv, result.order, result.items, pending.backorder);
-      await this._notifySupervisorsNewOrder(result.order, result.items, pending);
+      await this._sendOrderConfirmation(jid, conv, result.order, result.items, isBackorder && !autoApprove);
+      // Bug #1: Pass phone directly instead of relying on order object
+      await this._notifySupervisorsNewOrder(result.order, result.items, pending, phone);
     } catch (err) {
       Conversation.resetState(conv.id);
       logger.error('Order creation failed: ' + err.message);
@@ -361,6 +492,7 @@ class CustomerHandler {
     }
     return true;
   }
+
 
   async _sendOrderConfirmation(jid, conv, order, items, isBackorder) {
     const company = config.company;
@@ -383,7 +515,8 @@ class CustomerHandler {
     await this._reply(jid, conv, lines.join('\n'));
   }
 
-  async _notifySupervisorsNewOrder(order, items, pending) {
+  // Bug #1: Accept phone parameter directly instead of relying on order.phone_number
+  async _notifySupervisorsNewOrder(order, items, pending, phone) {
     const company = config.company;
     const summary = items
       .map((it) => `  • ${it.product_name} — ${it.quantity} × ${it.unit_price} ${company.symbol}`)
@@ -398,7 +531,7 @@ class CustomerHandler {
       header,
       '',
       `🆔 رقم الطلب: ${order.order_number}`,
-      `📱 العميل: ${phoneUtil.formatForDisplay(order.phone_number || order.customer_phone || '')}`,
+      `📱 العميل: ${phoneUtil.formatForDisplay(phone)}`,
       '',
       summary,
       '',
@@ -428,6 +561,15 @@ class CustomerHandler {
       return this._reply(jid, conv, 'تم استلام موقعك. شكراً!');
     }
 
+    // Bug #3 & #8: Double-check order is not cancelled
+    const orderRow = require('../database/connection').getMain()
+      .prepare('SELECT status FROM orders WHERE id = ?').get(orderId);
+    if (!orderRow || orderRow.status === ORDER_STATUS.CANCELLED) {
+      Conversation.resetState(conv.id);
+      return this._reply(jid, conv,
+        '❌ الطلب المرتبط ملغي. لا يمكن حفظ الموقع.\n\nاكتب *منتجات* لعرض الكتالوج.');
+    }
+
     const address = location.address || location.name
       || `${location.latitude}, ${location.longitude}`;
     Order.attachLocation(orderId, {
@@ -445,6 +587,9 @@ class CustomerHandler {
       `سنقوم بتجهيز طلبك والتواصل معك قريباً.`);
 
     logger.info(`Location saved for order ${orderNumber}`);
+
+    // Bug #4: Notify supervisors with location
+    this._notifySupervisorsLocation(orderNumber, phone, location, address);
   }
 
   async _handleLocationInput(jid, conv, phone, text, fresh) {
@@ -453,6 +598,15 @@ class CustomerHandler {
     if (!orderId) {
       Conversation.resetState(conv.id);
       return;
+    }
+
+    // Bug #3 & #8: Double-check order is not cancelled
+    const orderRow = require('../database/connection').getMain()
+      .prepare('SELECT status FROM orders WHERE id = ?').get(orderId);
+    if (!orderRow || orderRow.status === ORDER_STATUS.CANCELLED) {
+      Conversation.resetState(conv.id);
+      return this._reply(jid, conv,
+        '❌ الطلب المرتبط ملغي. لا يمكن حفظ العنوان.\n\nاكتب *منتجات* لعرض الكتالوج.');
     }
 
     const address = text.trim();
@@ -470,6 +624,29 @@ class CustomerHandler {
       `📝 ${address}\n\n` +
       `سنقوم بتجهيز طلبك والتواصل معك قريباً.`);
     logger.info(`Address saved for order ${orderNumber}`);
+
+    // Bug #4: Notify supervisors with location
+    this._notifySupervisorsLocation(orderNumber, phone, null, address);
+  }
+
+  // Bug #4: New method - notify supervisors when location is received
+  _notifySupervisorsLocation(orderNumber, phone, location, address) {
+    const lines = [
+      '📍 *تم استلام موقع العميل*',
+      '',
+      `🆔 الطلب: ${orderNumber}`,
+      `📱 العميل: ${phoneUtil.formatForDisplay(phone)}`,
+      `📍 العنوان: ${address}`,
+    ];
+    if (location && location.latitude) {
+      lines.push(`🗺️ الإحداثيات: ${location.latitude}, ${location.longitude}`);
+    }
+
+    for (const sup of config.supervisors || []) {
+      const supJid = phoneUtil.normalizeJid(sup.phone);
+      this.client.sendTypingReply(supJid, lines.join('\n'))
+        .catch((err) => logger.warn(`Supervisor location notify failed: ${err.message}`));
+    }
   }
 
   async _handleComplaint(jid, conv, phone, text) {

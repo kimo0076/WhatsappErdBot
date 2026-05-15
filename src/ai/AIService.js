@@ -23,7 +23,7 @@ class AIService {
     this.maxTokens = parseInt(process.env.AI_MAX_TOKENS, 10) || 800;
     this.temperature = parseFloat(process.env.AI_TEMPERATURE) || 0.7;
     this.maxRetries = parseInt(process.env.AI_MAX_RETRIES, 10) || 3;
-    this.timeout = parseInt(process.env.AI_TIMEOUT, 10) || 30000;
+    this.timeout = parseInt(process.env.AI_TIMEOUT, 10) || 15000;
     this.company = null;
   }
 
