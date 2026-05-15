@@ -2,31 +2,29 @@
 
 const OpenAI = require('openai');
 const logger = require('../utils/logger');
+const db = require('../database/connection');
+const settings = require('../utils/settings');
 
+/**
+ * AI gateway. Uses OpenCode Go's OpenAI-compatible endpoint.
+ *
+ * Hardening relative to the original:
+ *   - lazy client (no API key required to load the module)
+ *   - retries with exponential backoff
+ *   - per-request timeout
+ *   - persisted conversation memory in `ai_memory` (survives restarts)
+ *   - JSON helper accepts maxRetriesOverride to keep latency low
+ *     for the structured-extraction path (intent classify / order extract)
+ */
 class AIService {
   constructor() {
     this._client = null;
     this.model = process.env.AI_MODEL || 'qwen3.5-plus';
-    this.maxTokens = parseInt(process.env.AI_MAX_TOKENS) || 800;
+    this.maxTokens = parseInt(process.env.AI_MAX_TOKENS, 10) || 800;
     this.temperature = parseFloat(process.env.AI_TEMPERATURE) || 0.7;
-    this.maxRetries = parseInt(process.env.AI_MAX_RETRIES) || 3;
-    this.timeout = parseInt(process.env.AI_TIMEOUT) || 30000;
-
-    this.history = new Map();
+    this.maxRetries = parseInt(process.env.AI_MAX_RETRIES, 10) || 3;
+    this.timeout = parseInt(process.env.AI_TIMEOUT, 10) || 30000;
     this.company = null;
-
-    const HOUR = 60 * 60 * 1000;
-    setInterval(() => {
-      const cutoff = Date.now() - 4 * HOUR;
-      let cleaned = 0;
-      for (const [key, entry] of this.history) {
-        if (entry._ts && entry._ts < cutoff) {
-          this.history.delete(key);
-          cleaned++;
-        }
-      }
-      if (cleaned > 0) logger.info(`AI history cleanup: removed ${cleaned} sessions`);
-    }, 30 * 60 * 1000).unref();
   }
 
   get client() {
@@ -36,7 +34,7 @@ class AIService {
       }
       this._client = new OpenAI({
         apiKey: process.env.OPENCODE_GO_API_KEY,
-        baseURL: 'https://opencode.ai/zen/go/v1',
+        baseURL: process.env.AI_BASE_URL || 'https://opencode.ai/zen/go/v1',
       });
     }
     return this._client;
@@ -65,15 +63,14 @@ class AIService {
 
 قواعد:
 - ردودك قصيرة وواضحة (3-5 أسطر كحد أقصى)
-- استخدم الإيموجي باعتدال 🌹✨
+- استخدم الإيموجي باعتدال
 - لا تخترع أسعاراً دقيقة، قل: "سأتحقق لك من السعر"
 - كن دقيقاً ومفيداً
-- إذا طلب العميل التحدث مع مشرف: "سيتواصل معك أحد مندوبينا قريباً ⏰"`;
+- إذا طلب العميل التحدث مع مشرف: "سيتواصل معك أحد مندوبينا قريباً"`;
   }
 
   async chat(messages, options = {}) {
     let lastError;
-
     const attempts = options.maxRetriesOverride || this.maxRetries;
 
     for (let attempt = 1; attempt <= attempts; attempt++) {
@@ -83,15 +80,10 @@ class AIService {
           temperature: options.temperature != null ? options.temperature : this.temperature,
           max_tokens: options.maxTokens || this.maxTokens,
           messages,
-        }, {
-          timeout: this.timeout,
-        });
+        }, { timeout: this.timeout });
 
-        const content = response.choices[0]?.message?.content;
-        if (!content) {
-          logger.warn('AI returned empty response: ' + JSON.stringify(response.choices[0]));
-          throw new Error('Empty AI response');
-        }
+        const content = response.choices?.[0]?.message?.content;
+        if (!content) throw new Error('Empty AI response');
 
         return {
           text: content.trim(),
@@ -105,7 +97,6 @@ class AIService {
         }
       }
     }
-
     throw lastError;
   }
 
@@ -118,57 +109,91 @@ class AIService {
       { temperature: 0.1, ...options },
     );
 
-    const clean = res.text.replace(/```(?:json)?\n?/g, '').trim();
+    // Strip code fences and find the first JSON value.
+    let clean = res.text.replace(/```(?:json)?\n?/g, '').trim();
+    const firstBrace = clean.search(/[\[{]/);
+    if (firstBrace > 0) clean = clean.slice(firstBrace);
+
     try {
       return JSON.parse(clean);
-    } catch {
-      logger.warn('JSON parse failed, raw: ' + clean.substring(0, 100));
+    } catch (err) {
+      logger.warn('JSON parse failed, raw: ' + clean.substring(0, 120));
       return null;
     }
   }
 
-  async generateReply(sessionId, userMessage) {
-    if (!this.history.has(sessionId)) {
-      this.history.set(sessionId, []);
-    }
+  // ────────────────────────────────────────────────────────────────────
+  // Persisted conversation memory
+  // ────────────────────────────────────────────────────────────────────
 
-    const history = this.history.get(sessionId);
-    history._ts = Date.now();
+  _loadHistory(sessionId, max) {
+    try {
+      const rows = db.getMain().prepare(`
+        SELECT role, content FROM ai_memory
+         WHERE session_id = ?
+         ORDER BY id DESC
+         LIMIT ?
+      `).all(sessionId, max);
+      return rows.reverse().map((r) => ({ role: r.role, content: r.content }));
+    } catch (err) {
+      logger.warn(`AI history load failed: ${err.message}`);
+      return [];
+    }
+  }
+
+  _saveTurn(sessionId, role, content) {
+    try {
+      db.getMain().prepare(`
+        INSERT INTO ai_memory (session_id, role, content) VALUES (?, ?, ?)
+      `).run(sessionId, role, content);
+    } catch (err) {
+      logger.warn(`AI history write failed: ${err.message}`);
+    }
+  }
+
+  async generateReply(sessionId, userMessage) {
+    const max = settings.getInt('ai_history_max_messages', 20);
+    const history = this._loadHistory(sessionId, max);
+
     const messages = [
       { role: 'system', content: this.buildSystemPrompt() },
-      ...history.slice(-10),
+      ...history,
       { role: 'user', content: userMessage },
     ];
 
     const res = await this.chat(messages);
-
-    history.push({ role: 'user', content: userMessage });
-    history.push({ role: 'assistant', content: res.text });
-
-    if (history.length > 20) {
-      history.splice(0, 2);
-    }
-
+    this._saveTurn(sessionId, 'user', userMessage);
+    this._saveTurn(sessionId, 'assistant', res.text);
     return res;
   }
 
   clearHistory(sessionId) {
-    this.history.delete(sessionId);
+    try {
+      db.getMain().prepare(
+        'DELETE FROM ai_memory WHERE session_id = ?'
+      ).run(sessionId);
+    } catch (err) {
+      logger.warn(`AI history clear failed: ${err.message}`);
+    }
   }
+
+  // ────────────────────────────────────────────────────────────────────
+  // Structured tasks
+  // ────────────────────────────────────────────────────────────────────
 
   async classifyIntent(text) {
     try {
       const result = await this.askJSON(
-        `Classify this message. Reply with ONLY the JSON object, no explanation.
+        `Classify this message. Reply with ONLY a JSON object, no explanation.
 {
   "intent": "greeting|order|product_inquiry|price_inquiry|catalog_request|categories_request|complaint|supervisor_request|other",
   "confidence": 0.0
 }`,
         text,
-        { maxTokens: 1500, temperature: 0.1, maxRetriesOverride: 1 },
+        { maxTokens: 800, temperature: 0.1, maxRetriesOverride: 1 },
       );
       return result?.intent || 'other';
-    } catch {
+    } catch (_) {
       return 'other';
     }
   }
@@ -176,7 +201,7 @@ class AIService {
   async extractOrder(text) {
     try {
       return await this.askJSON(
-        `Extract order details. Reply with ONLY the JSON object, no explanation.
+        `Extract order details. Reply with ONLY a JSON object, no explanation.
 {
   "hasOrder": true,
   "items": [
@@ -184,11 +209,11 @@ class AIService {
   ],
   "needsConfirmation": true
 }
-If no clear order, set hasOrder to false and items to [].`,
+If no clear order is present, set hasOrder to false and items to [].`,
         text,
-        { maxTokens: 2000, temperature: 0.1, maxRetriesOverride: 1 },
+        { maxTokens: 1200, temperature: 0.1, maxRetriesOverride: 1 },
       );
-    } catch {
+    } catch (_) {
       return { hasOrder: false, items: [] };
     }
   }
