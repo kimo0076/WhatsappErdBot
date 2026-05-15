@@ -88,8 +88,10 @@ function parseDelimited(rawText, delimiter) {
   if (!rows.length) return [];
 
   const headers = rows[0].map((h) => h.toLowerCase().trim());
-  const looksLikeHeader = /[a-zA-Z\u0600-\u06FF]/.test(headers.join(''));
-
+  const hasLetters = /[a-zA-Z\u0600-\u06FF]/.test(headers.join(''));
+  const digitFields = headers.filter((h) => /\d/.test(h)).length;
+  // Only treat as header if: 2+ rows, has text, and most fields are NOT numbers
+  const looksLikeHeader = rows.length > 1 && hasLetters && digitFields < headers.length / 2;
   const dataRows = looksLikeHeader ? rows.slice(1) : rows;
   return { headers: looksLikeHeader ? headers : null, dataRows };
 }
@@ -131,7 +133,14 @@ function mapRow(values, headers) {
 
 function parseCSV(text) {
   const format = detectFormat(text);
-  if (format === 'natural' || format === 'empty') return [];
+  if (format === 'empty') return [];
+
+  if (format === 'natural') {
+    return text.trim().split('\n')
+      .filter((l) => l.trim())
+      .map((line) => ({ name: line.trim(), price: 0, stock: 0, unit: 'قطعة', category: 'عام' }));
+  }
+
   const delimiter = getDelimiter(format);
   const parsed = parseDelimited(text, delimiter);
   if (!parsed || !parsed.dataRows.length) return [];
@@ -321,8 +330,9 @@ async function importPipeline(text, options = {}) {
   if (format === 'natural' && !options.skipAI) {
     records = await parseWithAI(text);
     usedAI = true;
-    if (!records) {
+    if (!records || !records.length) {
       records = parseCSV(text);
+      usedAI = false;
     }
   } else {
     records = parseCSV(text);
